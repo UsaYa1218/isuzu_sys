@@ -146,6 +146,9 @@ def fetch_voucher(voucher_id: str) -> dict[str, Any] | None:
     voucher["document_json"].setdefault("tables", [])
     voucher["document_json"].setdefault("ocr_lines", [])
     voucher["document_json"].setdefault("warnings", [])
+    voucher["document_json"].setdefault("llm_used", False)
+    voucher["document_json"].setdefault("llm_status", "unused")
+    voucher["document_json"].setdefault("llm_messages", [])
     voucher["items"] = items
     voucher["audit_logs"] = logs
     return voucher

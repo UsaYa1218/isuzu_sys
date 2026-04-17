@@ -9,6 +9,9 @@
       `deep-research-report.md` の方針に合わせて、OCR、LLM 正規化、Validation、
       人手レビュー、Excel/CSV 出力をローカル完結でまとめた画面です。
     </p>
+    <p class="hero-meta">
+      <span class="pill">LLMモデル: {{ settings.ollama_model }}</span>
+    </p>
   </div>
 </section>
 
@@ -25,8 +28,9 @@
     </label>
     <label>
       PDF / 画像
-      <input type="file" name="file" accept=".pdf,.png,.jpg,.jpeg,.webp" required />
+      <input type="file" name="files" accept=".pdf,.png,.jpg,.jpeg,.webp" multiple required />
     </label>
+    <p class="upload-help">複数ファイルをまとめて選択できます。複数選択時は一覧に戻り、各伝票を順番にOCR処理します。</p>
     <button type="submit">OCR を開始する</button>
   </form>
 </section>
@@ -53,9 +57,9 @@
         {% for voucher in vouchers %}
         <tr>
           <td><a href="/vouchers/{{ voucher.id }}">{{ voucher.id }}</a></td>
-          <td>{{ voucher.type }}</td>
+          <td>{{ voucher_type_labels.get(voucher.type, voucher.type) }}</td>
           <td>
-            <span class="status status-{{ voucher.status|lower }}">{{ voucher.status }}</span>
+            <span class="status status-{{ voucher.status|lower }}">{{ status_labels.get(voucher.status, voucher.status) }}</span>
           </td>
           <td>{{ voucher.vendor_name or "-" }}</td>
           <td>{{ voucher.document_number or "-" }}</td>

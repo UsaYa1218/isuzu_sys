@@ -12,7 +12,41 @@ from ..config import settings
 logger = logging.getLogger(__name__)
 
 
-def _prompt(voucher_type: str, raw_text: str, heuristic_draft: dict[str, Any]) -> str:
+def _generate_json(prompt: str) -> tuple[dict[str, Any] | None, str | None, bool]:
+    if not settings.ollama_base_url.strip() or not settings.ollama_model.strip():
+        return None, "LLM設定が未入力です。", False
+
+    options = {"temperature": 0, **settings.ollama_generate_options}
+    headers = settings.ollama_headers or None
+    try:
+        response = httpx.post(
+            f"{settings.ollama_base_url.rstrip('/')}/api/generate",
+            headers=headers,
+            json={
+                "model": settings.ollama_model,
+                "prompt": prompt,
+                "stream": False,
+                "format": "json",
+                "options": options,
+            },
+            timeout=settings.ollama_timeout_seconds,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        body = payload.get("response", "").strip()
+        if not body:
+            return None, "LLMから空のレスポンスが返されました。", True
+        try:
+            return json.loads(body), None, True
+        except json.JSONDecodeError as exc:
+            logger.warning("Ollama JSON decode failed: %s", exc)
+            return None, "LLMのJSON解析に失敗しました。", True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Ollama request skipped: %s", exc)
+        return None, f"LLM実行失敗: {type(exc).__name__}: {exc}", True
+
+
+def _normalization_prompt(voucher_type: str, raw_text: str, heuristic_draft: dict[str, Any]) -> str:
     return f"""
 あなたは伝票転記補助モデルです。次の OCR テキストとヒューリスティック抽出結果を正規化してください。
 
@@ -60,26 +94,63 @@ OCR テキスト:
 """.strip()
 
 
-def normalize_with_ollama(voucher_type: str, raw_text: str, heuristic_draft: dict[str, Any]) -> dict[str, Any] | None:
-    prompt = _prompt(voucher_type, raw_text, heuristic_draft)
-    try:
-        response = httpx.post(
-            f"{settings.ollama_base_url.rstrip('/')}/api/generate",
-            json={
-                "model": settings.ollama_model,
-                "prompt": prompt,
-                "stream": False,
-                "format": "json",
-                "options": {"temperature": 0},
-            },
-            timeout=settings.ollama_timeout_seconds,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        body = payload.get("response", "").strip()
-        if not body:
-            return None
-        return json.loads(body)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Ollama normalization skipped: %s", exc)
-        return None
+def _table_reconstruction_prompt(voucher_type: str, raw_text: str, heuristic_tables: list[dict[str, Any]]) -> str:
+    return f"""
+あなたは OCR 後の帳票再構成モデルです。
+壊れた表や結合された表を、人がレビューしやすい表へ整理してください。
+
+制約:
+- OCR に無い情報を推測して補わない
+- 異なる表が混ざっている場合は分割する
+- ヘッダは短い日本語にする
+- 値が曖昧なセルは空文字にする
+- 必ず JSON のみ返す
+
+JSON 形式:
+{{
+  "tables": [
+    {{
+      "title": "",
+      "headers": [""],
+      "rows": [[""]]
+    }}
+  ],
+  "items": [
+    {{
+      "description": "",
+      "quantity": null,
+      "unit": null,
+      "unit_price": null,
+      "amount": null,
+      "tax_rate": null
+    }}
+  ],
+  "warnings": []
+}}
+
+伝票種別: {voucher_type}
+
+暫定表:
+{json.dumps(heuristic_tables, ensure_ascii=False, indent=2)}
+
+OCR テキスト:
+{raw_text}
+""".strip()
+
+
+def normalize_with_ollama(
+    voucher_type: str,
+    raw_text: str,
+    heuristic_draft: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None, bool]:
+    return _generate_json(_normalization_prompt(voucher_type, raw_text, heuristic_draft))
+
+
+def reconstruct_tables_with_ollama(
+    voucher_type: str,
+    raw_text: str,
+    heuristic_tables: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, str | None, bool]:
+    if not heuristic_tables:
+        return None, None, False
+    return _generate_json(_table_reconstruction_prompt(voucher_type, raw_text, heuristic_tables))

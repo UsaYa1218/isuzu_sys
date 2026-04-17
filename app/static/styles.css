@@ -95,7 +95,8 @@ body {
 }
 
 h1,
-h2 {
+h2,
+h3 {
   margin: 0 0 10px;
   line-height: 1.1;
 }
@@ -108,10 +109,18 @@ h2 {
   font-size: 1.2rem;
 }
 
+h3 {
+  font-size: 1rem;
+}
+
 .lede {
   margin: 0;
   color: var(--muted);
   max-width: 70ch;
+}
+
+.hero-meta {
+  margin: 14px 0 0;
 }
 
 form,
@@ -125,6 +134,12 @@ form,
   align-items: end;
 }
 
+.upload-help {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.92rem;
+}
+
 .form-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
@@ -133,6 +148,22 @@ form,
 
 .full-span {
   grid-column: 1 / -1;
+}
+
+.form-section + .form-section {
+  margin-top: 22px;
+  padding-top: 18px;
+  border-top: 1px solid rgba(215, 203, 180, 0.7);
+}
+
+.panel-header.compact {
+  margin-bottom: 12px;
+}
+
+.section-note {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 0.9rem;
 }
 
 label {
@@ -188,6 +219,28 @@ button.danger {
 
 .table-wrap {
   overflow-x: auto;
+}
+
+.preview-panel {
+  overflow: hidden;
+}
+
+.source-preview-frame,
+.source-preview-image {
+  width: 100%;
+  border: 1px solid rgba(215, 203, 180, 0.7);
+  border-radius: 18px;
+  background: #f7f2e8;
+}
+
+.source-preview-frame {
+  min-height: 780px;
+}
+
+.source-preview-image {
+  display: block;
+  max-height: 980px;
+  object-fit: contain;
 }
 
 table {
@@ -299,6 +352,7 @@ th {
 .table-meta {
   display: flex;
   gap: 12px;
+  flex-wrap: wrap;
   align-items: center;
   margin-bottom: 10px;
   color: var(--muted);
@@ -332,5 +386,9 @@ th {
   .action-row {
     flex-direction: column;
     align-items: flex-start;
+  }
+
+  .source-preview-frame {
+    min-height: 520px;
   }
 }

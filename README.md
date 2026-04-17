@@ -79,6 +79,22 @@ Set-ExecutionPolicy -Scope Process Bypass
 - `PADDLEOCR_LANG`: 既定 `japan`
 - `OLLAMA_BASE_URL`: 既定 `http://127.0.0.1:11434`
 - `OLLAMA_MODEL`: 既定 `qwen2.5:7b`
+- `OLLAMA_HEADERS_JSON`: 外部 Ollama に追加したい HTTP ヘッダー。JSON object 文字列
+- `OLLAMA_GENERATE_OPTIONS_JSON`: Ollama API の `options` に渡す JSON object 文字列
+
+## Colab 連携
+
+Colab の Computing Unit を使って LLM だけを外出しできます。  
+ローカルアプリはそのまま動かし、`OLLAMA_BASE_URL` だけ Colab 側に向けます。
+
+最短手順:
+
+1. Colab でこのリポジトリを clone
+2. `colab/start_ollama_colab.py` を開き、`#%%` セルを上から順に実行
+3. 出力された `public_base_url` をローカル `.env` の `OLLAMA_BASE_URL` に設定
+4. ローカルで `run.cmd` を起動
+
+詳細は [docs/colab-ollama.md](docs/colab-ollama.md) を参照してください。
 
 ## 画面 / API
 

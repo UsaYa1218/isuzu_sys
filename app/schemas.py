@@ -56,6 +56,7 @@ class ExtractedTable:
     page: int
     table_index: int
     bbox: list[float]
+    title: str = ""
     headers: list[str] = field(default_factory=list)
     rows: list[list[str]] = field(default_factory=list)
 
@@ -70,6 +71,8 @@ class ExtractionResult:
     ocr_lines: list[OCRLine] = field(default_factory=list)
     tables: list[ExtractedTable] = field(default_factory=list)
     llm_used: bool = False
+    llm_status: str = "unused"
+    llm_messages: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -81,4 +84,6 @@ class ExtractionResult:
             "ocr_lines": [asdict(line) for line in self.ocr_lines],
             "tables": [asdict(table) for table in self.tables],
             "llm_used": self.llm_used,
+            "llm_status": self.llm_status,
+            "llm_messages": self.llm_messages,
         }

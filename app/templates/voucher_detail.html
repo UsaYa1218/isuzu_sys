@@ -1,27 +1,33 @@
 {% extends "base.html" %}
 
 {% block content %}
+{% set validation = voucher.validation_json %}
+{% set tables = voucher.document_json["tables"] %}
+{% set type_label = voucher_type_labels.get(voucher.type, voucher.type) %}
+{% set status_label = status_labels.get(voucher.status, voucher.status) %}
+
 <section class="panel detail-hero">
   <div>
-    <p class="eyebrow">Voucher Detail</p>
-    <h1>{{ voucher.id }}</h1>
+    <p class="eyebrow">Review</p>
+    <h1>伝票レビュー</h1>
+    <p class="lede">{{ voucher.source_filename }}</p>
     <p class="lede">
-      Status: <span class="status status-{{ voucher.status|lower }}">{{ voucher.status }}</span>
+      状態:
+      <span class="status status-{{ voucher.status|lower }}">{{ status_label }}</span>
       {% if voucher.needs_review %}
-      <span class="pill review-pill">Needs Review</span>
+      <span class="pill review-pill">要確認</span>
       {% endif %}
     </p>
   </div>
   <div class="action-row">
-    <a class="ghost-button" href="/vouchers/{{ voucher.id }}/export/xlsx">Export Excel</a>
-    <a class="ghost-button" href="/vouchers/{{ voucher.id }}/export/csv">Export CSV(zip)</a>
+    <a class="ghost-button" href="/vouchers/{{ voucher.id }}/export/xlsx">Excel出力</a>
+    <a class="ghost-button" href="/vouchers/{{ voucher.id }}/export/csv">CSV(zip)出力</a>
   </div>
 </section>
 
-{% set validation = voucher.validation_json %}
 {% if validation.warnings %}
 <section class="panel warning-panel">
-  <h2>Validation Warnings</h2>
+  <h2>確認メッセージ</h2>
   <ul class="warning-list">
     {% for warning in validation.warnings %}
     <li>{{ warning }}</li>
@@ -30,25 +36,39 @@
 </section>
 {% endif %}
 
-{% set tables = voucher.document_json["tables"] %}
+{% if source_preview_kind %}
+<section class="panel preview-panel">
+  <div class="panel-header">
+    <h2>元PDF / 画像</h2>
+    <a class="ghost-button" href="{{ source_preview_url }}" target="_blank" rel="noopener noreferrer">別タブで開く</a>
+  </div>
+  {% if source_preview_kind == "pdf" %}
+  <iframe class="source-preview-frame" src="{{ source_preview_url }}" title="元PDFプレビュー"></iframe>
+  {% elif source_preview_kind == "image" %}
+  <img class="source-preview-image" src="{{ source_preview_url }}" alt="元画像プレビュー" />
+  {% endif %}
+</section>
+{% endif %}
+
 {% if tables %}
 <section class="panel">
   <div class="panel-header">
-    <h2>Detected Tables</h2>
-    <span class="pill">{{ tables|length }} tables</span>
+    <h2>抽出された表</h2>
+    <span class="pill">{{ tables|length }}件</span>
   </div>
   {% for table in tables %}
   <article class="detected-table">
     <div class="table-meta">
-      <strong>Page {{ table.page }}</strong>
-      <span>Table {{ table.table_index }}</span>
+      <strong>{{ table.title or (table.table_index ~ "番目の表") }}</strong>
+      <span>{{ table.page }}ページ目</span>
+      <span>{{ table.rows|length }}行</span>
     </div>
     <div class="table-wrap">
       <table>
         <thead>
           <tr>
             {% for header in table.headers %}
-            <th>{{ header or ("Column " ~ loop.index) }}</th>
+            <th>{{ header or ("列" ~ loop.index) }}</th>
             {% endfor %}
           </tr>
         </thead>
@@ -71,140 +91,183 @@
 <section class="detail-grid">
   <section class="panel">
     <div class="panel-header">
-      <h2>Review</h2>
-      <span class="pill">confidence: {{ voucher.confidence or 0 }}</span>
+      <div>
+        <h2>確認・修正</h2>
+        <p class="section-note">日本語の帳票に合わせて、基本情報と明細をここで整えます。</p>
+      </div>
+      <span class="pill">信頼度: {{ "%.3f"|format(voucher.confidence or 0) }}</span>
     </div>
     <form action="/vouchers/{{ voucher.id }}/review" method="post" class="review-form">
       <input type="hidden" name="type" value="{{ voucher.type }}" />
       <input type="hidden" name="status" value="{{ voucher.status }}" />
 
-      <div class="form-grid">
-        <label>
-          Voucher Type
-          <input value="{{ voucher.type }}" disabled />
-        </label>
-        <label>
-          Issue Date
-          <input type="date" name="issue_date" value="{{ voucher.issue_date or '' }}" />
-        </label>
-        <label>
-          Due Date
-          <input type="date" name="due_date" value="{{ voucher.due_date or '' }}" />
-        </label>
-        <label>
-          Document Number
-          <input name="document_number" value="{{ voucher.document_number or '' }}" />
-        </label>
-        <label>
-          Vendor Name
-          <input name="vendor_name" value="{{ voucher.vendor_name or '' }}" />
-        </label>
-        <label>
-          Customer Name
-          <input name="customer_name" value="{{ voucher.customer_name or '' }}" />
-        </label>
-        <label>
-          Currency
-          <input name="currency" value="{{ voucher.currency or 'JPY' }}" />
-        </label>
-        <label>
-          Subtotal
-          <input type="number" step="0.01" name="subtotal" value="{{ voucher.subtotal or '' }}" />
-        </label>
-        <label>
-          Tax
-          <input type="number" step="0.01" name="tax" value="{{ voucher.tax or '' }}" />
-        </label>
-        <label>
-          Discount
-          <input type="number" step="0.01" name="discount" value="{{ voucher.discount or '' }}" />
-        </label>
-        <label>
-          Grand Total
-          <input type="number" step="0.01" name="grand_total" value="{{ voucher.grand_total or '' }}" />
-        </label>
-        <label class="full-span">
-          Notes
-          <textarea name="notes" rows="3">{{ voucher.notes or '' }}</textarea>
-        </label>
-      </div>
+      <section class="form-section">
+        <div class="panel-header compact">
+          <h3>基本情報</h3>
+          <span class="pill">{{ type_label }}</span>
+        </div>
+        <div class="form-grid">
+          <label>
+            伝票種別
+            <input value="{{ type_label }}" disabled />
+          </label>
+          <label>
+            {{ field_labels.issue_date }}
+            <input type="date" name="issue_date" value="{{ voucher.issue_date or '' }}" />
+          </label>
+          <label>
+            {{ field_labels.due_date }}
+            <input type="date" name="due_date" value="{{ voucher.due_date or '' }}" />
+          </label>
+          <label>
+            {{ field_labels.document_number }}
+            <input name="document_number" value="{{ voucher.document_number or '' }}" />
+          </label>
+          <label>
+            {{ field_labels.vendor_name }}
+            <input name="vendor_name" value="{{ voucher.vendor_name or '' }}" />
+          </label>
+          <label>
+            {{ field_labels.customer_name }}
+            <input name="customer_name" value="{{ voucher.customer_name or '' }}" />
+          </label>
+          <label>
+            {{ field_labels.currency }}
+            <input name="currency" value="{{ voucher.currency or 'JPY' }}" />
+          </label>
+          <label class="full-span">
+            {{ field_labels.notes }}
+            <textarea name="notes" rows="3">{{ voucher.notes or '' }}</textarea>
+          </label>
+        </div>
+      </section>
 
-      <div class="panel-header">
-        <h2>Items</h2>
-        <button type="button" class="ghost-button" data-add-item-row>Add Row</button>
-      </div>
+      <section class="form-section">
+        <div class="panel-header compact">
+          <h3>金額情報</h3>
+          <span class="section-note">金額がある帳票のみ入力</span>
+        </div>
+        <div class="form-grid">
+          <label>
+            {{ field_labels.subtotal }}
+            <input type="number" step="0.01" name="subtotal" value="{{ voucher.subtotal or '' }}" />
+          </label>
+          <label>
+            {{ field_labels.tax }}
+            <input type="number" step="0.01" name="tax" value="{{ voucher.tax or '' }}" />
+          </label>
+          <label>
+            {{ field_labels.discount }}
+            <input type="number" step="0.01" name="discount" value="{{ voucher.discount or '' }}" />
+          </label>
+          <label>
+            {{ field_labels.grand_total }}
+            <input type="number" step="0.01" name="grand_total" value="{{ voucher.grand_total or '' }}" />
+          </label>
+        </div>
+      </section>
 
-      <div class="table-wrap">
-        <table id="items-table">
-          <thead>
-            <tr>
-              <th>Description</th>
-              <th>Quantity</th>
-              <th>Unit</th>
-              <th>Unit Price</th>
-              <th>Amount</th>
-              <th>Tax Rate</th>
-            </tr>
-          </thead>
-          <tbody>
-            {% for item in voucher["items"] %}
-            <tr>
-              <td>
-                <input type="hidden" name="item_id" value="{{ item.id }}" />
-                <input name="item_description" value="{{ item.description or '' }}" />
-              </td>
-              <td><input type="number" step="0.001" name="item_quantity" value="{{ item.quantity or '' }}" /></td>
-              <td><input name="item_unit" value="{{ item.unit or '' }}" /></td>
-              <td><input type="number" step="0.01" name="item_unit_price" value="{{ item.unit_price or '' }}" /></td>
-              <td><input type="number" step="0.01" name="item_amount" value="{{ item.amount or '' }}" /></td>
-              <td><input type="number" step="0.01" name="item_tax_rate" value="{{ item.tax_rate or '' }}" /></td>
-            </tr>
-            {% endfor %}
-            {% if not voucher["items"] %}
-            <tr>
-              <td>
-                <input type="hidden" name="item_id" value="" />
-                <input name="item_description" value="" />
-              </td>
-              <td><input type="number" step="0.001" name="item_quantity" value="" /></td>
-              <td><input name="item_unit" value="" /></td>
-              <td><input type="number" step="0.01" name="item_unit_price" value="" /></td>
-              <td><input type="number" step="0.01" name="item_amount" value="" /></td>
-              <td><input type="number" step="0.01" name="item_tax_rate" value="" /></td>
-            </tr>
-            {% endif %}
-          </tbody>
-        </table>
-      </div>
+      <section class="form-section">
+        <div class="panel-header compact">
+          <div>
+            <h3>明細 / 車両情報</h3>
+            <p class="section-note">車種・VIN・寸法など、表から拾えた内容もここに入ります。</p>
+          </div>
+          <button type="button" class="ghost-button" data-add-item-row>行を追加</button>
+        </div>
+
+        <div class="table-wrap">
+          <table id="items-table">
+            <thead>
+              <tr>
+                <th>内容</th>
+                <th>数量</th>
+                <th>単位</th>
+                <th>単価</th>
+                <th>金額</th>
+                <th>税率</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in voucher["items"] %}
+              <tr>
+                <td>
+                  <input type="hidden" name="item_id" value="{{ item.id }}" />
+                  <input name="item_description" value="{{ item.description or '' }}" />
+                </td>
+                <td><input type="number" step="0.001" name="item_quantity" value="{{ item.quantity or '' }}" /></td>
+                <td><input name="item_unit" value="{{ item.unit or '' }}" /></td>
+                <td><input type="number" step="0.01" name="item_unit_price" value="{{ item.unit_price or '' }}" /></td>
+                <td><input type="number" step="0.01" name="item_amount" value="{{ item.amount or '' }}" /></td>
+                <td><input type="number" step="0.01" name="item_tax_rate" value="{{ item.tax_rate or '' }}" /></td>
+              </tr>
+              {% endfor %}
+              {% if not voucher["items"] %}
+              <tr>
+                <td>
+                  <input type="hidden" name="item_id" value="" />
+                  <input name="item_description" value="" />
+                </td>
+                <td><input type="number" step="0.001" name="item_quantity" value="" /></td>
+                <td><input name="item_unit" value="" /></td>
+                <td><input type="number" step="0.01" name="item_unit_price" value="" /></td>
+                <td><input type="number" step="0.01" name="item_amount" value="" /></td>
+                <td><input type="number" step="0.01" name="item_tax_rate" value="" /></td>
+              </tr>
+              {% endif %}
+            </tbody>
+          </table>
+        </div>
+      </section>
 
       <div class="action-row">
-        <button type="submit">Save Review</button>
+        <button type="submit">確認内容を保存</button>
       </div>
     </form>
   </section>
 
   <aside class="panel side-panel">
-    <h2>Status Actions</h2>
-    <form action="/vouchers/{{ voucher.id }}/transition" method="post" class="stack">
-      <button type="submit" name="action" value="submit">Set Ready For Approval</button>
-      <button type="submit" name="action" value="approve">Approve</button>
-      <button type="submit" name="action" value="reject" class="danger">Reject</button>
-      <button type="submit" name="action" value="reopen" class="ghost-button">Back To Review</button>
-    </form>
-
-    <h2>OCR Metadata</h2>
+    <h2>伝票概要</h2>
     <dl class="meta-list">
-      <dt>Source File</dt>
+      <dt>伝票ID</dt>
+      <dd>{{ voucher.id }}</dd>
+      <dt>種別</dt>
+      <dd>{{ type_label }}</dd>
+      <dt>状態</dt>
+      <dd>{{ status_label }}</dd>
+      <dt>元ファイル</dt>
       <dd>{{ voucher.source_filename }}</dd>
-      <dt>LLM</dt>
-      <dd>{{ "Used" if voucher.document_json.llm_used else "Skipped/Failed" }}</dd>
-      <dt>OCR Lines</dt>
+      <dt>LLM補正</dt>
+      <dd>
+        {% if voucher.document_json.llm_status == "applied" %}
+        利用済み
+        {% elif voucher.document_json.llm_status == "failed" %}
+        実行失敗
+        {% else %}
+        未使用
+        {% endif %}
+      </dd>
+      {% if voucher.document_json.llm_messages %}
+      <dt>LLM詳細</dt>
+      <dd>{{ voucher.document_json.llm_messages | join(" / ") }}</dd>
+      {% endif %}
+      <dt>LLMモデル</dt>
+      <dd>{{ settings.ollama_model }}</dd>
+      <dt>OCR行数</dt>
       <dd>{{ voucher.document_json.ocr_lines|length if voucher.document_json.ocr_lines else 0 }}</dd>
-      <dt>Created At</dt>
+      <dt>登録日時</dt>
       <dd>{{ voucher.created_at }}</dd>
     </dl>
 
-    <h2>Audit Logs</h2>
+    <h2>状態変更</h2>
+    <form action="/vouchers/{{ voucher.id }}/transition" method="post" class="stack">
+      <button type="submit" name="action" value="submit">承認待ちにする</button>
+      <button type="submit" name="action" value="approve">承認する</button>
+      <button type="submit" name="action" value="reject" class="danger">差戻しにする</button>
+      <button type="submit" name="action" value="reopen" class="ghost-button">レビューに戻す</button>
+    </form>
+
+    <h2>監査ログ</h2>
     <div class="audit-list">
       {% for log in voucher.audit_logs %}
       <article class="audit-item">
@@ -212,14 +275,14 @@
         <p>{{ log.created_at }}</p>
       </article>
       {% else %}
-      <p class="empty">No audit logs yet.</p>
+      <p class="empty">まだログはありません。</p>
       {% endfor %}
     </div>
   </aside>
 </section>
 
 <section class="panel">
-  <h2>OCR Raw Text</h2>
+  <h2>OCRテキスト</h2>
   <pre class="ocr-text">{{ voucher.document_json.raw_text or '' }}</pre>
 </section>
 {% endblock %}

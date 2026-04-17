@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -28,6 +30,15 @@ def _load_dotenv(dotenv_path: Path) -> None:
 _load_dotenv(BASE_DIR / ".env")
 
 
+def _parse_json_object(value: str | None) -> dict[str, Any]:
+    if value is None or not value.strip():
+        return {}
+    parsed = json.loads(value)
+    if not isinstance(parsed, dict):
+        raise ValueError("Expected a JSON object in environment configuration.")
+    return parsed
+
+
 @dataclass(slots=True)
 class Settings:
     app_env: str
@@ -41,12 +52,17 @@ class Settings:
     static_dir: Path
     ocr_dpi: int
     ocr_confidence_threshold: float
+    paddleocr_max_side_limit: int
     paddleocr_lang: str
     paddleocr_use_gpu: bool
     paddleocr_model_dir: Path
+    remote_ocr_base_url: str
+    remote_ocr_timeout_seconds: int
     ollama_base_url: str
     ollama_model: str
     ollama_timeout_seconds: int
+    ollama_headers: dict[str, Any]
+    ollama_generate_options: dict[str, Any]
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -66,12 +82,17 @@ class Settings:
             static_dir=BASE_DIR / "app" / "static",
             ocr_dpi=int(os.getenv("OCR_DPI", "300")),
             ocr_confidence_threshold=float(os.getenv("OCR_CONFIDENCE_THRESHOLD", "0.75")),
+            paddleocr_max_side_limit=int(os.getenv("PADDLEOCR_MAX_SIDE_LIMIT", "5600")),
             paddleocr_lang=os.getenv("PADDLEOCR_LANG", "japan"),
             paddleocr_use_gpu=_to_bool(os.getenv("PADDLEOCR_USE_GPU"), False),
             paddleocr_model_dir=data_dir / "paddleocr",
+            remote_ocr_base_url=os.getenv("REMOTE_OCR_BASE_URL", ""),
+            remote_ocr_timeout_seconds=int(os.getenv("REMOTE_OCR_TIMEOUT_SECONDS", "300")),
             ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434"),
             ollama_model=os.getenv("OLLAMA_MODEL", "qwen2.5:7b"),
             ollama_timeout_seconds=int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "180")),
+            ollama_headers=_parse_json_object(os.getenv("OLLAMA_HEADERS_JSON")),
+            ollama_generate_options=_parse_json_object(os.getenv("OLLAMA_GENERATE_OPTIONS_JSON")),
         )
         settings.ensure_directories()
         return settings
