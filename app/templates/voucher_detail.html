@@ -1,0 +1,225 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="panel detail-hero">
+  <div>
+    <p class="eyebrow">Voucher Detail</p>
+    <h1>{{ voucher.id }}</h1>
+    <p class="lede">
+      Status: <span class="status status-{{ voucher.status|lower }}">{{ voucher.status }}</span>
+      {% if voucher.needs_review %}
+      <span class="pill review-pill">Needs Review</span>
+      {% endif %}
+    </p>
+  </div>
+  <div class="action-row">
+    <a class="ghost-button" href="/vouchers/{{ voucher.id }}/export/xlsx">Export Excel</a>
+    <a class="ghost-button" href="/vouchers/{{ voucher.id }}/export/csv">Export CSV(zip)</a>
+  </div>
+</section>
+
+{% set validation = voucher.validation_json %}
+{% if validation.warnings %}
+<section class="panel warning-panel">
+  <h2>Validation Warnings</h2>
+  <ul class="warning-list">
+    {% for warning in validation.warnings %}
+    <li>{{ warning }}</li>
+    {% endfor %}
+  </ul>
+</section>
+{% endif %}
+
+{% set tables = voucher.document_json["tables"] %}
+{% if tables %}
+<section class="panel">
+  <div class="panel-header">
+    <h2>Detected Tables</h2>
+    <span class="pill">{{ tables|length }} tables</span>
+  </div>
+  {% for table in tables %}
+  <article class="detected-table">
+    <div class="table-meta">
+      <strong>Page {{ table.page }}</strong>
+      <span>Table {{ table.table_index }}</span>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            {% for header in table.headers %}
+            <th>{{ header or ("Column " ~ loop.index) }}</th>
+            {% endfor %}
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in table.rows %}
+          <tr>
+            {% for cell in row %}
+            <td>{{ cell }}</td>
+            {% endfor %}
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </article>
+  {% endfor %}
+</section>
+{% endif %}
+
+<section class="detail-grid">
+  <section class="panel">
+    <div class="panel-header">
+      <h2>Review</h2>
+      <span class="pill">confidence: {{ voucher.confidence or 0 }}</span>
+    </div>
+    <form action="/vouchers/{{ voucher.id }}/review" method="post" class="review-form">
+      <input type="hidden" name="type" value="{{ voucher.type }}" />
+      <input type="hidden" name="status" value="{{ voucher.status }}" />
+
+      <div class="form-grid">
+        <label>
+          Voucher Type
+          <input value="{{ voucher.type }}" disabled />
+        </label>
+        <label>
+          Issue Date
+          <input type="date" name="issue_date" value="{{ voucher.issue_date or '' }}" />
+        </label>
+        <label>
+          Due Date
+          <input type="date" name="due_date" value="{{ voucher.due_date or '' }}" />
+        </label>
+        <label>
+          Document Number
+          <input name="document_number" value="{{ voucher.document_number or '' }}" />
+        </label>
+        <label>
+          Vendor Name
+          <input name="vendor_name" value="{{ voucher.vendor_name or '' }}" />
+        </label>
+        <label>
+          Customer Name
+          <input name="customer_name" value="{{ voucher.customer_name or '' }}" />
+        </label>
+        <label>
+          Currency
+          <input name="currency" value="{{ voucher.currency or 'JPY' }}" />
+        </label>
+        <label>
+          Subtotal
+          <input type="number" step="0.01" name="subtotal" value="{{ voucher.subtotal or '' }}" />
+        </label>
+        <label>
+          Tax
+          <input type="number" step="0.01" name="tax" value="{{ voucher.tax or '' }}" />
+        </label>
+        <label>
+          Discount
+          <input type="number" step="0.01" name="discount" value="{{ voucher.discount or '' }}" />
+        </label>
+        <label>
+          Grand Total
+          <input type="number" step="0.01" name="grand_total" value="{{ voucher.grand_total or '' }}" />
+        </label>
+        <label class="full-span">
+          Notes
+          <textarea name="notes" rows="3">{{ voucher.notes or '' }}</textarea>
+        </label>
+      </div>
+
+      <div class="panel-header">
+        <h2>Items</h2>
+        <button type="button" class="ghost-button" data-add-item-row>Add Row</button>
+      </div>
+
+      <div class="table-wrap">
+        <table id="items-table">
+          <thead>
+            <tr>
+              <th>Description</th>
+              <th>Quantity</th>
+              <th>Unit</th>
+              <th>Unit Price</th>
+              <th>Amount</th>
+              <th>Tax Rate</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for item in voucher["items"] %}
+            <tr>
+              <td>
+                <input type="hidden" name="item_id" value="{{ item.id }}" />
+                <input name="item_description" value="{{ item.description or '' }}" />
+              </td>
+              <td><input type="number" step="0.001" name="item_quantity" value="{{ item.quantity or '' }}" /></td>
+              <td><input name="item_unit" value="{{ item.unit or '' }}" /></td>
+              <td><input type="number" step="0.01" name="item_unit_price" value="{{ item.unit_price or '' }}" /></td>
+              <td><input type="number" step="0.01" name="item_amount" value="{{ item.amount or '' }}" /></td>
+              <td><input type="number" step="0.01" name="item_tax_rate" value="{{ item.tax_rate or '' }}" /></td>
+            </tr>
+            {% endfor %}
+            {% if not voucher["items"] %}
+            <tr>
+              <td>
+                <input type="hidden" name="item_id" value="" />
+                <input name="item_description" value="" />
+              </td>
+              <td><input type="number" step="0.001" name="item_quantity" value="" /></td>
+              <td><input name="item_unit" value="" /></td>
+              <td><input type="number" step="0.01" name="item_unit_price" value="" /></td>
+              <td><input type="number" step="0.01" name="item_amount" value="" /></td>
+              <td><input type="number" step="0.01" name="item_tax_rate" value="" /></td>
+            </tr>
+            {% endif %}
+          </tbody>
+        </table>
+      </div>
+
+      <div class="action-row">
+        <button type="submit">Save Review</button>
+      </div>
+    </form>
+  </section>
+
+  <aside class="panel side-panel">
+    <h2>Status Actions</h2>
+    <form action="/vouchers/{{ voucher.id }}/transition" method="post" class="stack">
+      <button type="submit" name="action" value="submit">Set Ready For Approval</button>
+      <button type="submit" name="action" value="approve">Approve</button>
+      <button type="submit" name="action" value="reject" class="danger">Reject</button>
+      <button type="submit" name="action" value="reopen" class="ghost-button">Back To Review</button>
+    </form>
+
+    <h2>OCR Metadata</h2>
+    <dl class="meta-list">
+      <dt>Source File</dt>
+      <dd>{{ voucher.source_filename }}</dd>
+      <dt>LLM</dt>
+      <dd>{{ "Used" if voucher.document_json.llm_used else "Skipped/Failed" }}</dd>
+      <dt>OCR Lines</dt>
+      <dd>{{ voucher.document_json.ocr_lines|length if voucher.document_json.ocr_lines else 0 }}</dd>
+      <dt>Created At</dt>
+      <dd>{{ voucher.created_at }}</dd>
+    </dl>
+
+    <h2>Audit Logs</h2>
+    <div class="audit-list">
+      {% for log in voucher.audit_logs %}
+      <article class="audit-item">
+        <strong>{{ log.action }}</strong>
+        <p>{{ log.created_at }}</p>
+      </article>
+      {% else %}
+      <p class="empty">No audit logs yet.</p>
+      {% endfor %}
+    </div>
+  </aside>
+</section>
+
+<section class="panel">
+  <h2>OCR Raw Text</h2>
+  <pre class="ocr-text">{{ voucher.document_json.raw_text or '' }}</pre>
+</section>
+{% endblock %}
