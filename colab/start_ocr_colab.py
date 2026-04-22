@@ -2,6 +2,7 @@ from __future__ import annotations
 
 #%%
 import json
+import inspect
 import os
 import platform
 import re
@@ -83,6 +84,10 @@ def ensure_cloudflared_installed(bin_dir: Path) -> Path:
         return Path(existing)
     bin_dir.mkdir(parents=True, exist_ok=True)
     destination = bin_dir / "cloudflared"
+    if destination.exists():
+        destination.chmod(destination.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        os.environ["PATH"] = f"{bin_dir}:{os.environ.get('PATH', '')}"
+        return destination
     urllib.request.urlretrieve(CLOUDFLARED_BINARY_URL, destination)
     destination.chmod(destination.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     os.environ["PATH"] = f"{bin_dir}:{os.environ.get('PATH', '')}"
@@ -99,6 +104,7 @@ def ensure_python_dependencies() -> None:
         "httpx>=0.28,<1.0",
         "numpy>=1.26,<3.0",
         "paddleocr==3.2.0",
+        "langchain<0.3",
     ]
     command = f"{shlex.quote(shutil.which('python') or 'python')} -m pip install -q " + " ".join(shlex.quote(package) for package in packages)
     run_shell(command)
@@ -234,14 +240,50 @@ def _build_lines_from_predict(results: list[Any], fallback_page: int) -> list[di
     return lines
 
 
+def _build_lines_from_legacy_ocr_result(raw_result: Any, fallback_page: int) -> list[dict[str, Any]]:
+    lines: list[dict[str, Any]] = []
+    page_lines = _unwrap_result(raw_result)
+    for entry in page_lines or []:
+        try:
+            bbox = [[float(x), float(y)] for x, y in entry[0]]
+            text = str(entry[1][0]).strip()
+            confidence = float(entry[1][1])
+        except (IndexError, TypeError, ValueError):
+            continue
+        if not text:
+            continue
+        lines.append(
+            {
+                "text": _normalize_ocr_text(text),
+                "confidence": confidence,
+                "bbox": bbox,
+                "page": fallback_page,
+            }
+        )
+    return lines
+
+
+def _uses_modern_predict_api(engine: Any) -> bool:
+    predict = getattr(engine, "predict", None)
+    if not callable(predict):
+        return False
+    try:
+        parameters = inspect.signature(predict).parameters
+    except (TypeError, ValueError):
+        return False
+    return "use_doc_orientation_classify" in parameters
+
+
 def run_ocr(file_path: Path) -> list[dict[str, Any]]:
     engine = get_ocr_engine()
+    use_modern_api = _uses_modern_predict_api(engine)
     all_lines: list[dict[str, Any]] = []
     for page_index, image in enumerate(load_document_images(file_path), start=1):
         prepared = preprocess_image(image)
+        prepared_array = np.array(prepared)
         if hasattr(engine, "predict"):
             try:
-                results = engine.predict(np.array(prepared))
+                results = engine.predict(prepared_array)
                 predicted_lines = _build_lines_from_predict(list(results), fallback_page=page_index)
                 if predicted_lines:
                     all_lines.extend(predicted_lines)
@@ -249,25 +291,22 @@ def run_ocr(file_path: Path) -> list[dict[str, Any]]:
             except Exception:
                 pass
 
-        result = engine.ocr(np.array(prepared), cls=True)
-        page_lines = _unwrap_result(result)
-        for entry in page_lines or []:
-            try:
-                bbox = [[float(x), float(y)] for x, y in entry[0]]
-                text = str(entry[1][0]).strip()
-                confidence = float(entry[1][1])
-            except (IndexError, TypeError, ValueError):
-                continue
-            if not text:
-                continue
-            all_lines.append(
-                {
-                    "text": _normalize_ocr_text(text),
-                    "confidence": confidence,
-                    "bbox": bbox,
-                    "page": page_index,
-                }
-            )
+        try:
+            if use_modern_api:
+                result = engine.ocr(prepared_array)
+            else:
+                result = engine.ocr(prepared_array, cls=True)
+        except TypeError as exc:
+            if "unexpected keyword argument 'cls'" not in str(exc):
+                raise
+            result = engine.ocr(prepared_array)
+
+        predicted_lines = _build_lines_from_predict(list(result), fallback_page=page_index)
+        if predicted_lines:
+            all_lines.extend(predicted_lines)
+            continue
+
+        all_lines.extend(_build_lines_from_legacy_ocr_result(result, fallback_page=page_index))
     return sorted(
         all_lines,
         key=lambda line: (

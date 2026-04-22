@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import inspect
 import logging
 import os
 import re
@@ -1101,6 +1102,41 @@ def _build_lines_from_predict(results: list[Any], fallback_page: int) -> list[OC
     return lines
 
 
+def _build_lines_from_legacy_ocr_result(raw_result: Any, fallback_page: int) -> list[OCRLine]:
+    lines: list[OCRLine] = []
+    page_lines = _unwrap_result(raw_result)
+    for entry in page_lines or []:
+        try:
+            bbox = [[float(x), float(y)] for x, y in entry[0]]
+            text = str(entry[1][0]).strip()
+            confidence = float(entry[1][1])
+        except (IndexError, TypeError, ValueError):
+            logger.warning("Unexpected OCR entry skipped: %s", entry)
+            continue
+        if not text:
+            continue
+        lines.append(
+            OCRLine(
+                text=_normalize_ocr_text(text),
+                confidence=confidence,
+                bbox=bbox,
+                page=fallback_page,
+            )
+        )
+    return lines
+
+
+def _uses_modern_predict_api(engine: Any) -> bool:
+    predict = getattr(engine, "predict", None)
+    if not callable(predict):
+        return False
+    try:
+        parameters = inspect.signature(predict).parameters
+    except (TypeError, ValueError):
+        return False
+    return "use_doc_orientation_classify" in parameters
+
+
 def _run_remote_ocr(file_path: Path) -> list[OCRLine]:
     url = f"{settings.remote_ocr_base_url.rstrip('/')}/ocr"
     with file_path.open("rb") as stream:
@@ -1123,12 +1159,14 @@ def run_ocr(file_path: Path) -> list[OCRLine]:
             logger.warning("Remote OCR failed, fallback to local OCR: %s", exc)
 
     engine = _get_ocr_engine()
+    use_modern_api = _uses_modern_predict_api(engine)
     all_lines: list[OCRLine] = []
     for page_index, image in enumerate(load_document_images(file_path), start=1):
         prepared = preprocess_image(image)
+        prepared_array = np.array(prepared)
         if hasattr(engine, "predict"):
             try:
-                results = engine.predict(np.array(prepared))
+                results = engine.predict(prepared_array)
                 predicted_lines = _build_lines_from_predict(list(results), fallback_page=page_index)
                 if predicted_lines:
                     all_lines.extend(predicted_lines)
@@ -1136,24 +1174,21 @@ def run_ocr(file_path: Path) -> list[OCRLine]:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("PaddleOCR predict() failed, fallback to ocr(): %s", exc)
 
-        result = engine.ocr(np.array(prepared), cls=True)
-        page_lines = _unwrap_result(result)
-        for entry in page_lines or []:
-            try:
-                bbox = [[float(x), float(y)] for x, y in entry[0]]
-                text = str(entry[1][0]).strip()
-                confidence = float(entry[1][1])
-            except (IndexError, TypeError, ValueError):
-                logger.warning("Unexpected OCR entry skipped: %s", entry)
-                continue
-            if not text:
-                continue
-            all_lines.append(
-                OCRLine(
-                    text=_normalize_ocr_text(text),
-                    confidence=confidence,
-                    bbox=bbox,
-                    page=page_index,
-                )
-            )
+        try:
+            if use_modern_api:
+                result = engine.ocr(prepared_array)
+            else:
+                result = engine.ocr(prepared_array, cls=True)
+        except TypeError as exc:
+            if "unexpected keyword argument 'cls'" not in str(exc):
+                raise
+            logger.warning("PaddleOCR ocr() rejected cls=True, retry without cls: %s", exc)
+            result = engine.ocr(prepared_array)
+
+        predicted_lines = _build_lines_from_predict(list(result), fallback_page=page_index)
+        if predicted_lines:
+            all_lines.extend(predicted_lines)
+            continue
+
+        all_lines.extend(_build_lines_from_legacy_ocr_result(result, fallback_page=page_index))
     return sorted(all_lines, key=lambda line: (line.page, round(line.center_y, 1), line.left))
