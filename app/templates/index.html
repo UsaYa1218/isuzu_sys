@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="hero">
+  <div>
+    <p class="eyebrow">MVP</p>
+    <h1>伝票アップロードからレビュー、出力までを一気通し</h1>
+    <p class="lede">
+      `deep-research-report.md` の方針に合わせて、OCR、LLM 正規化、Validation、
+      人手レビュー、Excel/CSV 出力をローカル完結でまとめた画面です。
+    </p>
+    <p class="hero-meta">
+      <span class="pill">LLMモデル: {{ settings.ollama_model }}</span>
+    </p>
+  </div>
+</section>
+
+<section class="panel">
+  <h2>新規 OCR 取込</h2>
+  <form action="/upload" method="post" enctype="multipart/form-data" class="upload-form">
+    <label>
+      伝票種別
+      <select name="voucher_type">
+        <option value="invoice">請求書</option>
+        <option value="delivery">納品書</option>
+        <option value="journal">仕訳伝票</option>
+      </select>
+    </label>
+    <label>
+      PDF / 画像
+      <input type="file" name="files" accept=".pdf,.png,.jpg,.jpeg,.webp" multiple required />
+    </label>
+    <p class="upload-help">複数ファイルをまとめて選択できます。複数選択時は一覧に戻り、各伝票を順番にOCR処理します。</p>
+    <button type="submit">OCR を開始する</button>
+  </form>
+</section>
+
+<section class="panel">
+  <div class="panel-header">
+    <h2>伝票一覧</h2>
+    <span class="pill">{{ vouchers|length }} 件</span>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>種別</th>
+          <th>状態</th>
+          <th>取引先</th>
+          <th>伝票番号</th>
+          <th>合計</th>
+          <th>更新日時</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for voucher in vouchers %}
+        <tr>
+          <td><a href="/vouchers/{{ voucher.id }}">{{ voucher.id }}</a></td>
+          <td>{{ voucher_type_labels.get(voucher.type, voucher.type) }}</td>
+          <td>
+            <span class="status status-{{ voucher.status|lower }}">{{ status_labels.get(voucher.status, voucher.status) }}</span>
+          </td>
+          <td>{{ voucher.vendor_name or "-" }}</td>
+          <td>{{ voucher.document_number or "-" }}</td>
+          <td>{{ voucher.grand_total or "-" }} {{ voucher.currency or "" }}</td>
+          <td>{{ voucher.updated_at }}</td>
+        </tr>
+        {% else %}
+        <tr>
+          <td colspan="7" class="empty">まだ伝票は登録されていません。</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}
