@@ -50,7 +50,7 @@ ITEM_HEADERS = {
 
 
 TABLE_HEADER_ALIASES = {
-    "description": ["品名", "摘要", "内容", "車種", "型式", "登録番号", "型式・登録番号", "車台番号", "車輌名称", "車両名称", "車両状態", "特記事項", "その他", "model", "vin", "現在地", "全長", "全幅", "全高", "重量"],
+    "description": ["品名", "摘要", "内容", "車種", "機種", "車型", "車番", "号機", "型式", "登録番号", "型式・登録番号", "車台番号", "車輌名称", "車両名称", "車両状態", "特記事項", "その他", "model", "vin", "現在地", "全長", "全幅", "全高", "重量"],
     "quantity": ["数量", "台数"],
     "unit": ["単位"],
     "unit_price": ["単価", "借方", "貸方"],
@@ -340,6 +340,10 @@ def _detect_item_rows_from_tables(tables: list[ExtractedTable]) -> list[VoucherI
             for index in (
                 _find_table_column(table.headers, ["品名", "摘要", "内容"]),
                 _find_table_column(table.headers, ["車種"]),
+                _find_table_column(table.headers, ["機種"]),
+                _find_table_column(table.headers, ["車型"]),
+                _find_table_column(table.headers, ["車番"]),
+                _find_table_column(table.headers, ["号機"]),
                 _find_table_column(table.headers, ["型式", "登録番号", "型式・登録番号"]),
                 _find_table_column(table.headers, ["車台番号"]),
                 _find_table_column(table.headers, ["車輌名称", "車両名称"]),

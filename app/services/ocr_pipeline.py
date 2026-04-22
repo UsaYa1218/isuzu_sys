@@ -1013,6 +1013,114 @@ def _extract_isuzu_dispatch_tables(ocr_lines: list[OCRLine]) -> list[ExtractedTa
     return tables
 
 
+def _extract_shipping_request_detail_tables(ocr_lines: list[OCRLine]) -> list[ExtractedTable]:
+    if not ocr_lines:
+        return []
+
+    tables: list[ExtractedTable] = []
+    pages = sorted({line.page for line in ocr_lines})
+    for page in pages:
+        page_lines = [line for line in ocr_lines if line.page == page]
+        title_line = _find_best_matching_line(page_lines, "輸送依頼書")
+        no_header = _find_best_matching_line(page_lines, "NO")
+        delivery_header = _find_best_matching_line(page_lines, "納入日時")
+        machine_header = _find_best_matching_line(page_lines, "機種")
+        unit_header = _find_best_matching_line(page_lines, "号機")
+        model_header = _find_best_matching_line(page_lines, "車型")
+        car_no_header = _find_best_matching_line(page_lines, "車番")
+        weight_header = _find_best_matching_line(page_lines, "重量")
+        address_header = _find_best_matching_line(page_lines, "住所")
+        destination_header = _find_best_matching_line(page_lines, "出荷先名")
+        estimate_header = _find_best_matching_line(page_lines, "輸送費見積")
+        if not (
+            title_line
+            and no_header
+            and delivery_header
+            and machine_header
+            and unit_header
+            and model_header
+            and car_no_header
+            and weight_header
+            and address_header
+            and destination_header
+        ):
+            continue
+
+        number_lines = [
+            line
+            for line in page_lines
+            if line.top >= no_header.top + 120
+            and line.left <= no_header.left + 120
+            and _normalize_table_cell(line.text).isdigit()
+        ]
+        number_lines.sort(key=lambda line: line.top)
+        if not number_lines:
+            continue
+
+        headers = ["NO", "納入日時", "機種", "号機", "車型", "車番", "重量", "住所", "出荷先名", "輸送費見積"]
+        vehicle_rows: list[list[str]] = []
+        involved_lines: list[OCRLine] = [
+            line
+            for line in [
+                title_line,
+                no_header,
+                delivery_header,
+                machine_header,
+                unit_header,
+                model_header,
+                car_no_header,
+                weight_header,
+                address_header,
+                destination_header,
+                estimate_header,
+            ]
+            if line is not None
+        ]
+
+        for index, number_line in enumerate(number_lines):
+            row_top = number_line.top - 55
+            if index + 1 < len(number_lines):
+                row_bottom = min(number_lines[index + 1].top - 120, number_line.top + 140)
+            else:
+                row_bottom = number_line.top + 170
+            row_lines = [line for line in page_lines if row_top <= line.top <= row_bottom and line.confidence >= 0.2]
+            row = [
+                _collect_band_text(row_lines, min_left=0, max_left=220, min_top=row_top, max_top=row_bottom),
+                _collect_band_text(row_lines, min_left=220, max_left=900, min_top=row_top, max_top=row_bottom),
+                _collect_band_text(row_lines, min_left=900, max_left=1310, min_top=row_top, max_top=row_bottom),
+                _collect_band_text(row_lines, min_left=1310, max_left=1600, min_top=row_top, max_top=row_bottom),
+                _collect_band_text(row_lines, min_left=1620, max_left=1920, min_top=row_top, max_top=row_bottom),
+                _collect_band_text(row_lines, min_left=1920, max_left=2260, min_top=row_top, max_top=row_bottom),
+                _collect_band_text(row_lines, min_left=2260, max_left=2520, min_top=row_top, max_top=row_bottom),
+                _collect_band_text(row_lines, min_left=2520, max_left=3900, min_top=row_top, max_top=row_bottom),
+                _collect_band_text(row_lines, min_left=3900, max_left=5200, min_top=row_top, max_top=row_bottom),
+                _collect_band_text(row_lines, min_left=5200, max_left=5600, min_top=row_top, max_top=row_bottom),
+            ]
+            if not any(row[1:]):
+                continue
+            vehicle_rows.append(row)
+            involved_lines.extend(row_lines)
+
+        if vehicle_rows:
+            tables.append(
+                ExtractedTable(
+                    page=page,
+                    table_index=0,
+                    bbox=[
+                        float(min(line.left for line in involved_lines)),
+                        float(min(line.top for line in involved_lines)),
+                        float(max(_line_bounds(line)[2] for line in involved_lines)),
+                        float(max(_line_bounds(line)[3] for line in involved_lines)),
+                    ],
+                    title="出荷情報",
+                    headers=headers,
+                    rows=vehicle_rows,
+                )
+            )
+
+    return tables
+
+
 def extract_tables(file_path: Path, ocr_lines: list[OCRLine] | None = None) -> list[ExtractedTable]:
     if ocr_lines is None:
         ocr_lines = run_ocr(file_path)
@@ -1021,17 +1129,18 @@ def extract_tables(file_path: Path, ocr_lines: list[OCRLine] | None = None) -> l
     semantic_tables = _extract_transport_section_table(ocr_lines)
     transport_request_tables = _extract_transport_request_tables(ocr_lines)
     dispatch_request_tables = _extract_isuzu_dispatch_tables(ocr_lines)
-    semantic_pages = {table.page for table in dispatch_request_tables}
+    shipping_request_tables = _extract_shipping_request_detail_tables(ocr_lines)
+    semantic_pages = {table.page for table in dispatch_request_tables + shipping_request_tables}
     if semantic_pages:
         vector_tables = [table for table in vector_tables if table.page not in semantic_pages]
     if vector_tables:
-        tables = vector_tables + semantic_tables + transport_request_tables + dispatch_request_tables
+        tables = vector_tables + semantic_tables + transport_request_tables + dispatch_request_tables + shipping_request_tables
     else:
         images = load_document_images(file_path)
         grid_tables = _collect_grid_tables(images, ocr_lines)
         if semantic_pages:
             grid_tables = [table for table in grid_tables if table.page not in semantic_pages]
-        tables = grid_tables + semantic_tables + transport_request_tables + dispatch_request_tables
+        tables = grid_tables + semantic_tables + transport_request_tables + dispatch_request_tables + shipping_request_tables
 
     tables.sort(key=lambda table: (table.page, table.bbox[1] if len(table.bbox) > 1 else 0, table.bbox[0] if table.bbox else 0))
     for index, table in enumerate(tables, start=1):
