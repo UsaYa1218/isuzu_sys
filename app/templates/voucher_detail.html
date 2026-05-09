@@ -259,6 +259,24 @@
       <dd>{{ voucher.created_at }}</dd>
     </dl>
 
+    {% if voucher.document_json.context_hints %}
+    <h2>LLM Context Hints</h2>
+    <div class="audit-list">
+      {% for hint in voucher.document_json.context_hints %}
+      <article class="audit-item">
+        <strong>{{ hint.kind }}</strong>
+        <p>{{ hint.value }}</p>
+        {% if hint.field_key %}
+        <p>field: {{ hint.field_key }}</p>
+        {% endif %}
+        {% if hint.reason %}
+        <p>{{ hint.reason }}</p>
+        {% endif %}
+      </article>
+      {% endfor %}
+    </div>
+    {% endif %}
+
     <h2>状態変更</h2>
     <form action="/vouchers/{{ voucher.id }}/transition" method="post" class="stack">
       <button type="submit" name="action" value="submit">承認待ちにする</button>

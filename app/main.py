@@ -4,11 +4,13 @@ import json
 from mimetypes import guess_type
 import shutil
 import uuid
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -35,6 +37,8 @@ app = FastAPI(title=settings.app_name)
 templates = Jinja2Templates(directory=str(settings.templates_path))
 app.mount("/static", StaticFiles(directory=str(settings.static_dir)), name="static")
 init_db()
+OCR_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ocr-worker")
+OCR_FUTURES: set[Future[None]] = set()
 
 VOUCHER_TYPE_LABELS = {
     "invoice": "請求書 / 依頼票",
@@ -69,6 +73,11 @@ FIELD_LABELS = {
 
 def _new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
+
+
+def _log_ocr(message: str) -> None:
+    timestamp = datetime.now().isoformat(timespec="seconds")
+    print(f"[OCR] {timestamp} {message}", flush=True)
 
 
 def _to_float(value: str | None) -> float | None:
@@ -148,6 +157,7 @@ def _build_review_document_json(
     document_json.setdefault("raw_text", "")
     document_json.setdefault("ocr_lines", [])
     document_json.setdefault("tables", [])
+    document_json.setdefault("context_hints", [])
     document_json.setdefault("llm_used", False)
     document_json.setdefault("llm_status", "unused")
     document_json.setdefault("llm_messages", [])
@@ -235,14 +245,23 @@ def _resolve_voucher_source_path(voucher: dict[str, Any]) -> Path:
 def process_voucher_ocr(voucher_id: str) -> None:
     voucher = fetch_voucher(voucher_id)
     if voucher is None:
+        _log_ocr(f"skip missing voucher voucher_id={voucher_id}")
         return
 
     try:
         source_path = Path(voucher["source_path"])
+        _log_ocr(f"start voucher_id={voucher_id} file={source_path.name} type={voucher['type']}")
+        _log_ocr(f"run OCR voucher_id={voucher_id}")
         lines = run_ocr(source_path)
+        _log_ocr(f"OCR done voucher_id={voucher_id} lines={len(lines)}")
+        _log_ocr(f"extract tables voucher_id={voucher_id}")
         tables = extract_tables(source_path, ocr_lines=lines)
+        _log_ocr(f"tables done voucher_id={voucher_id} tables={len(tables)}")
+        _log_ocr(f"extract fields voucher_id={voucher_id}")
         extraction = extract_document(voucher["type"], lines, tables=tables)
+        _log_ocr(f"fields done voucher_id={voucher_id} items={len(extraction.items)}")
         validation = validate_extraction(extraction)
+        _log_ocr(f"validation done voucher_id={voucher_id} status={validation['status']}")
         field_values = {key: field.value for key, field in extraction.fields.items()}
         max_confidence = max((field.confidence for field in extraction.fields.values()), default=0.0)
         items = [
@@ -289,7 +308,9 @@ def process_voucher_ocr(voucher_id: str) -> None:
         }
         update_voucher(voucher_id, payload, _serialize_items_for_db(voucher_id, items))
         append_audit_log(_new_id("log"), voucher_id, "OCR_COMPLETED", {"status": validation["status"], "warnings": validation["warnings"]})
+        _log_ocr(f"completed voucher_id={voucher_id} status={validation['status']} warnings={len(validation['warnings'])}")
     except Exception as exc:  # noqa: BLE001
+        _log_ocr(f"failed voucher_id={voucher_id} error={exc}")
         payload = {
             "type": voucher["type"],
             "status": "OCR_FAILED",
@@ -316,9 +337,36 @@ def process_voucher_ocr(voucher_id: str) -> None:
         append_audit_log(_new_id("log"), voucher_id, "OCR_FAILED", {"error": str(exc)})
 
 
+def _on_ocr_done(future: Future[None]) -> None:
+    OCR_FUTURES.discard(future)
+    try:
+        future.result()
+    except Exception as exc:  # noqa: BLE001
+        # process_voucher_ocr handles per-voucher failures; this is a last-resort guard.
+        print(f"OCR worker failed unexpectedly: {exc}")
+
+
+def enqueue_voucher_ocr(voucher_id: str) -> None:
+    _log_ocr(f"queued voucher_id={voucher_id} active={len(OCR_FUTURES)}")
+    future = OCR_EXECUTOR.submit(process_voucher_ocr, voucher_id)
+    OCR_FUTURES.add(future)
+    future.add_done_callback(_on_ocr_done)
+
+
 @app.on_event("startup")
 def on_startup() -> None:
     init_db()
+    if not settings.requeue_processing_ocr_on_startup:
+        return
+    for voucher in fetch_all_vouchers():
+        if voucher.get("status") == "OCR_PROCESSING":
+            append_audit_log(_new_id("log"), voucher["id"], "OCR_REQUEUED", {"reason": "startup"})
+            enqueue_voucher_ocr(voucher["id"])
+
+
+@app.on_event("shutdown")
+def on_shutdown() -> None:
+    OCR_EXECUTOR.shutdown(wait=False, cancel_futures=False)
 
 
 @app.get("/")
@@ -339,7 +387,6 @@ def index(request: Request):
 
 @app.post("/upload")
 async def upload_voucher(
-    background_tasks: BackgroundTasks,
     voucher_type: str = Form(...),
     files: list[UploadFile] = File(...),
 ):
@@ -349,7 +396,7 @@ async def upload_voucher(
             continue
         voucher_id = _accept_upload(voucher_type, upload)
         created_ids.append(voucher_id)
-        background_tasks.add_task(process_voucher_ocr, voucher_id)
+        enqueue_voucher_ocr(voucher_id)
 
     if not created_ids:
         raise HTTPException(status_code=400, detail="No files uploaded")

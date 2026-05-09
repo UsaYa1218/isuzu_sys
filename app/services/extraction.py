@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Any
 
 from ..config import settings
-from ..schemas import ExtractedField, ExtractedTable, ExtractionResult, OCRLine, VoucherItemDraft
+from ..schemas import ContextHint, ExtractedField, ExtractedTable, ExtractionResult, OCRLine, VoucherItemDraft
 from .llm import normalize_with_ollama, reconstruct_tables_with_ollama
 
 
@@ -63,6 +63,17 @@ DATE_PATTERNS = [
     re.compile(r"(\d{4})[/-](\d{1,2})[/-](\d{1,2})"),
     re.compile(r"(\d{4})年(\d{1,2})月(\d{1,2})日"),
 ]
+
+
+CONTEXT_KIND_LABELS = {
+    "person_name": "Person",
+    "company_name": "Company",
+    "address": "Address",
+    "phone": "Phone",
+    "email": "Email",
+    "memo": "Memo",
+    "document_context": "Context",
+}
 
 
 def _normalize_space(text: str) -> str:
@@ -136,6 +147,13 @@ def _parse_currency(text: str | None) -> str | None:
         return "JPY"
     match = re.search(r"\b[A-Z]{3}\b", upper)
     return match.group(0) if match else None
+
+
+def _coerce_confidence(value: Any, default: float = 0.0) -> float:
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except (TypeError, ValueError):
+        return default
 
 
 def _distance_score(label: OCRLine, candidate: OCRLine) -> float:
@@ -325,7 +343,14 @@ def _table_contains_item_candidates(table: ExtractedTable) -> bool:
         if any(alias and alias in header for alias in normalized_aliases):
             matched_columns += 1
     vehicle_spec = any("vin" in header for header in normalized_headers) and any("現在地" in header for header in headers)
-    return matched_columns >= 2 or vehicle_spec
+    shipping_spec = (
+        any(header in {"車型", "車番"} for header in headers)
+        and any(header in {"搬入場所", "所在場所"} for header in headers)
+    ) or (
+        "車型・車番" in headers
+        and any(header in {"車両引取場所", "車両搬入先"} for header in headers)
+    )
+    return matched_columns >= 2 or vehicle_spec or shipping_spec
 
 
 def _detect_item_rows_from_tables(tables: list[ExtractedTable]) -> list[VoucherItemDraft]:
@@ -343,12 +368,26 @@ def _detect_item_rows_from_tables(tables: list[ExtractedTable]) -> list[VoucherI
                 _find_table_column(table.headers, ["機種"]),
                 _find_table_column(table.headers, ["車型"]),
                 _find_table_column(table.headers, ["車番"]),
+                _find_table_column(table.headers, ["車型・車番"]),
                 _find_table_column(table.headers, ["号機"]),
                 _find_table_column(table.headers, ["型式", "登録番号", "型式・登録番号"]),
                 _find_table_column(table.headers, ["車台番号"]),
                 _find_table_column(table.headers, ["車輌名称", "車両名称"]),
                 _find_table_column(table.headers, ["車両状態"]),
                 _find_table_column(table.headers, ["特記事項", "その他"]),
+                _find_table_column(table.headers, ["引取可能日時"]),
+                _find_table_column(table.headers, ["所在場所"]),
+                _find_table_column(table.headers, ["車両引取場所"]),
+                _find_table_column(table.headers, ["搬入希望日時"]),
+                _find_table_column(table.headers, ["搬入場所"]),
+                _find_table_column(table.headers, ["車両搬入先"]),
+                _find_table_column(table.headers, ["負担部署"]),
+                _find_table_column(table.headers, ["搬送費負担部署"]),
+                _find_table_column(table.headers, ["支払い担当"]),
+                _find_table_column(table.headers, ["保険"]),
+                _find_table_column(table.headers, ["引渡担当"]),
+                _find_table_column(table.headers, ["受領担当"]),
+                _find_table_column(table.headers, ["搬送目的"]),
                 _find_table_column(table.headers, ["MODEL"]),
                 _find_table_column(table.headers, ["Vin"]),
                 _find_table_column(table.headers, ["現在地"]),
@@ -595,19 +634,72 @@ def _value_supported_by_ocr(key: str, value: Any, raw_text: str) -> bool:
     return normalized in haystack
 
 
+def _normalize_context_hints(raw_hints: list[dict[str, Any]], raw_text: str) -> list[ContextHint]:
+    hints: list[ContextHint] = []
+    seen: set[tuple[str, str, str]] = set()
+    for raw_hint in raw_hints:
+        if not isinstance(raw_hint, dict):
+            continue
+
+        kind = _normalize_space(str(raw_hint.get("kind") or raw_hint.get("label") or "document_context")).lower()
+        if not kind:
+            kind = "document_context"
+        value = _normalize_space(str(raw_hint.get("value") or raw_hint.get("text") or ""))
+        if not value or not _text_supported_by_ocr(value, raw_text):
+            continue
+
+        field_key = _normalize_space(str(raw_hint.get("field_key") or "")) or None
+        dedupe_key = (
+            kind,
+            re.sub(r"\s+", "", value).lower(),
+            field_key or "",
+        )
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+
+        hints.append(
+            ContextHint(
+                kind=kind,
+                value=value,
+                reason=_normalize_space(str(raw_hint.get("reason") or "")),
+                confidence=_coerce_confidence(raw_hint.get("confidence")),
+                field_key=field_key,
+                source="llm_context",
+            )
+        )
+    return hints
+
+
+def _context_hints_note(context_hints: list[ContextHint]) -> str | None:
+    parts: list[str] = []
+    for hint in context_hints:
+        if hint.field_key:
+            continue
+        label = CONTEXT_KIND_LABELS.get(hint.kind, hint.kind.replace("_", " ").title())
+        parts.append(f"{label}: {hint.value}")
+        if len(parts) >= 4:
+            break
+    if not parts:
+        return None
+    return " / ".join(parts)
+
+
 def _merge_with_llm(
     voucher_type: str,
     raw_text: str,
     fields: dict[str, ExtractedField],
     items: list[VoucherItemDraft],
-) -> tuple[dict[str, ExtractedField], list[VoucherItemDraft], list[str], bool, str, list[str]]:
+) -> tuple[dict[str, ExtractedField], list[VoucherItemDraft], list[ContextHint], list[str], bool, str, list[str]]:
     llm_result, llm_error, attempted = normalize_with_ollama(voucher_type, raw_text, _draft_for_llm(fields, items))
     if not llm_result:
         status = "failed" if attempted else "unused"
         messages = [llm_error] if llm_error else []
-        return fields, items, [], False, status, messages
+        return fields, items, [], [], False, status, messages
 
+    specs = FIELD_SPECS.get(voucher_type, FIELD_SPECS["invoice"])
     warnings: list[str] = list(llm_result.get("warnings") or [])
+    context_hints = _normalize_context_hints(llm_result.get("context_hints") or [], raw_text)
     llm_fields = llm_result.get("fields") or {}
     for key, current in fields.items():
         candidate = llm_fields.get(key)
@@ -620,14 +712,39 @@ def _merge_with_llm(
             current.value = candidate
             current.raw_text = str(candidate)
             current.source = "llm"
+            current.confidence = max(current.confidence, 0.68)
             current.needs_review = current.confidence < settings.ocr_confidence_threshold
+
+    for hint in context_hints:
+        if not hint.field_key or hint.field_key not in fields or hint.field_key not in specs:
+            continue
+        parsed_value = _parse_by_type(specs[hint.field_key]["type"], hint.value)
+        if parsed_value is None:
+            continue
+        current = fields[hint.field_key]
+        if current.value not in (None, "", 0) and not current.needs_review:
+            continue
+        current.value = parsed_value
+        current.raw_text = hint.value
+        current.source = hint.source
+        current.confidence = max(current.confidence, max(0.6, hint.confidence))
+        current.needs_review = current.confidence < settings.ocr_confidence_threshold
+
+    notes_field = fields.get("notes")
+    note_summary = _context_hints_note(context_hints)
+    if notes_field is not None and note_summary and (notes_field.value in (None, "") or notes_field.needs_review):
+        notes_field.value = note_summary
+        notes_field.raw_text = note_summary
+        notes_field.source = "llm_context"
+        notes_field.confidence = max(notes_field.confidence, 0.62)
+        notes_field.needs_review = notes_field.confidence < settings.ocr_confidence_threshold
 
     llm_items = llm_result.get("items") or []
     if llm_items and not items:
         merged_items = _normalize_llm_items(llm_items, raw_text)
         items = merged_items or items
 
-    return fields, items, warnings, True, "applied", []
+    return fields, items, context_hints, warnings, True, "applied", []
 
 
 def _merge_reconstructed_tables_with_llm(
@@ -671,7 +788,7 @@ def extract_document(voucher_type: str, lines: list[OCRLine], tables: list[Extra
     items = _detect_item_rows(lines, voucher_type)
     if not items and tables:
         items = _detect_item_rows_from_tables(tables)
-    fields, items, llm_warnings, llm_used, llm_status_1, llm_messages_1 = _merge_with_llm(voucher_type, raw_text, fields, items)
+    fields, items, context_hints, llm_warnings, llm_used, llm_status_1, llm_messages_1 = _merge_with_llm(voucher_type, raw_text, fields, items)
     tables, items, table_llm_warnings, table_llm_used, llm_status_2, llm_messages_2 = _merge_reconstructed_tables_with_llm(voucher_type, raw_text, tables, items)
     llm_status = _combine_llm_statuses([llm_status_1, llm_status_2])
     llm_messages = [message for message in [*llm_messages_1, *llm_messages_2] if message]
@@ -691,6 +808,7 @@ def extract_document(voucher_type: str, lines: list[OCRLine], tables: list[Extra
         raw_text=raw_text,
         ocr_lines=lines,
         tables=tables,
+        context_hints=context_hints,
         llm_used=llm_used or table_llm_used,
         llm_status=llm_status,
         llm_messages=llm_messages,

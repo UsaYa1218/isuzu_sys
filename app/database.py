@@ -15,9 +15,10 @@ def _dict_factory(cursor: sqlite3.Cursor, row: tuple[Any, ...]) -> dict[str, Any
 
 def get_connection() -> sqlite3.Connection:
     settings.database_path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(settings.database_path)
+    connection = sqlite3.connect(settings.database_path, timeout=30)
     connection.row_factory = _dict_factory
     connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA busy_timeout = 30000")
     return connection
 
 
@@ -37,6 +38,7 @@ def now_iso() -> str:
 
 def init_db() -> None:
     with connection_scope() as connection:
+        connection.execute("PRAGMA journal_mode = WAL")
         connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS vouchers (
@@ -149,6 +151,7 @@ def fetch_voucher(voucher_id: str) -> dict[str, Any] | None:
     voucher["document_json"].setdefault("llm_used", False)
     voucher["document_json"].setdefault("llm_status", "unused")
     voucher["document_json"].setdefault("llm_messages", [])
+    voucher["document_json"].setdefault("context_hints", [])
     voucher["items"] = items
     voucher["audit_logs"] = logs
     return voucher

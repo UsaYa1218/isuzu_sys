@@ -60,9 +60,13 @@ class Settings:
     remote_ocr_timeout_seconds: int
     ollama_base_url: str
     ollama_model: str
+    ollama_api_style: str
+    ollama_api_key: str
+    ollama_think: str
     ollama_timeout_seconds: int
     ollama_headers: dict[str, Any]
     ollama_generate_options: dict[str, Any]
+    requeue_processing_ocr_on_startup: bool
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -90,9 +94,13 @@ class Settings:
             remote_ocr_timeout_seconds=int(os.getenv("REMOTE_OCR_TIMEOUT_SECONDS", "300")),
             ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434"),
             ollama_model=os.getenv("OLLAMA_MODEL", "qwen2.5:7b"),
+            ollama_api_style=os.getenv("OLLAMA_API_STYLE", "auto").strip().lower() or "auto",
+            ollama_api_key=os.getenv("OLLAMA_API_KEY", "EMPTY"),
+            ollama_think=os.getenv("OLLAMA_THINK", "").strip(),
             ollama_timeout_seconds=int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "180")),
             ollama_headers=_parse_json_object(os.getenv("OLLAMA_HEADERS_JSON")),
             ollama_generate_options=_parse_json_object(os.getenv("OLLAMA_GENERATE_OPTIONS_JSON")),
+            requeue_processing_ocr_on_startup=_to_bool(os.getenv("REQUEUE_PROCESSING_OCR_ON_STARTUP"), False),
         )
         settings.ensure_directories()
         return settings

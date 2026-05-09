@@ -13,6 +13,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import traceback
 import urllib.request
 from functools import lru_cache
 from pathlib import Path
@@ -31,6 +32,7 @@ TUNNEL_TIMEOUT_SECONDS = int(os.environ.get("COLAB_OCR_TUNNEL_TIMEOUT", "90"))
 LOG_DIR = Path(os.environ.get("COLAB_OCR_LOG_DIR", "/content/ocr_runtime_logs"))
 BIN_DIR = Path(os.environ.get("COLAB_OCR_BIN_DIR", "/content/bin"))
 REMOTE_MAX_SIDE_LIMIT = int(os.environ.get("COLAB_OCR_MAX_SIDE_LIMIT", "5600"))
+OCR_DEVICE = os.environ.get("COLAB_OCR_DEVICE", "auto").strip().lower() or "auto"
 
 CLOUDFLARED_BINARY_URL = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
 TRYCLOUDFLARE_PATTERN = re.compile(r"https://[-a-z0-9]+\.trycloudflare\.com")
@@ -123,6 +125,10 @@ def detect_gpu() -> list[str]:
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
 
+def _gpu_available() -> bool:
+    return bool(detect_gpu())
+
+
 def _normalize_ocr_text(text: str) -> str:
     normalized = str(text).strip()
     for src, dest in OCR_TEXT_REPLACEMENTS:
@@ -164,14 +170,16 @@ def preprocess_image(image: Image.Image) -> Image.Image:
     return enhanced.convert("RGB")
 
 
-@lru_cache(maxsize=1)
-def get_ocr_engine() -> Any:
+def _build_ocr_engine(prefer_gpu: bool) -> Any:
     from paddleocr import PaddleOCR
+
+    use_gpu = prefer_gpu and _gpu_available()
+    device = "gpu" if use_gpu else "cpu"
 
     try:
         return PaddleOCR(
             lang="japan",
-            device="gpu",
+            device=device,
             use_doc_orientation_classify=False,
             use_doc_unwarping=False,
             use_textline_orientation=False,
@@ -183,13 +191,23 @@ def get_ocr_engine() -> Any:
             use_angle_cls=True,
             lang="japan",
             show_log=False,
-            use_gpu=True,
+            use_gpu=use_gpu,
             enable_mkldnn=False,
             ir_optim=False,
             cpu_threads=2,
             det_limit_side_len=REMOTE_MAX_SIDE_LIMIT,
             det_limit_type="max",
         )
+
+
+@lru_cache(maxsize=1)
+def get_gpu_ocr_engine() -> Any:
+    return _build_ocr_engine(prefer_gpu=True)
+
+
+@lru_cache(maxsize=1)
+def get_cpu_ocr_engine() -> Any:
+    return _build_ocr_engine(prefer_gpu=False)
 
 
 def _unwrap_result(raw_result: Any) -> list[Any]:
@@ -274,8 +292,7 @@ def _uses_modern_predict_api(engine: Any) -> bool:
     return "use_doc_orientation_classify" in parameters
 
 
-def run_ocr(file_path: Path) -> list[dict[str, Any]]:
-    engine = get_ocr_engine()
+def _run_ocr_with_engine(file_path: Path, engine: Any) -> list[dict[str, Any]]:
     use_modern_api = _uses_modern_predict_api(engine)
     all_lines: list[dict[str, Any]] = []
     for page_index, image in enumerate(load_document_images(file_path), start=1):
@@ -317,6 +334,20 @@ def run_ocr(file_path: Path) -> list[dict[str, Any]]:
     )
 
 
+def run_ocr(file_path: Path) -> list[dict[str, Any]]:
+    preferred_device = OCR_DEVICE
+    if preferred_device == "cpu":
+        return _run_ocr_with_engine(file_path, get_cpu_ocr_engine())
+
+    if preferred_device == "gpu":
+        return _run_ocr_with_engine(file_path, get_gpu_ocr_engine())
+
+    try:
+        return _run_ocr_with_engine(file_path, get_gpu_ocr_engine())
+    except Exception:
+        return _run_ocr_with_engine(file_path, get_cpu_ocr_engine())
+
+
 def build_ocr_app() -> FastAPI:
     app = FastAPI(title="Colab OCR Worker")
 
@@ -333,6 +364,11 @@ def build_ocr_app() -> FastAPI:
         temp_path.write_bytes(await file.read())
         try:
             return {"ocr_lines": run_ocr(temp_path)}
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "error": str(exc),
+                "traceback": traceback.format_exc(),
+            }
         finally:
             temp_path.unlink(missing_ok=True)
 
@@ -420,6 +456,7 @@ def start_ocr_colab(
 
     return {
         "gpu": detect_gpu(),
+        "ocr_device": OCR_DEVICE,
         "local_base_url": local_base_url,
         "public_base_url": public_base_url,
         "ocr_server_thread_alive": server_thread.is_alive(),

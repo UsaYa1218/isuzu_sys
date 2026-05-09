@@ -1,0 +1,11 @@
+{
+  "profiles": [
+    {
+      "name": "gpt-oss-120b-colab",
+      "base_url": "https://ceremony-citizenship-router-appeared.trycloudflare.com",
+      "model": "openai/gpt-oss-120b",
+      "api_style": "openai",
+      "api_key": "EMPTY"
+    }
+  ]
+}

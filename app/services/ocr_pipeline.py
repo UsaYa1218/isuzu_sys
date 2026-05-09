@@ -6,7 +6,9 @@ import logging
 import os
 import re
 import tempfile
+import unicodedata
 from collections import defaultdict
+from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -45,22 +47,44 @@ OCR_TEXT_REPLACEMENTS = (
 )
 
 
+def _log_ocr(message: str) -> None:
+    timestamp = datetime.now().isoformat(timespec="seconds")
+    print(f"[OCR] {timestamp} {message}", flush=True)
+
+
 def _existing_model_path(name: str) -> str | None:
-    path = settings.paddleocr_model_dir / name
-    if path.exists():
-        return str(path)
-    logger.warning("PaddleOCR local model directory was not found: %s", path)
+    candidates = [
+        settings.paddleocr_model_dir / name,
+        Path.home() / ".paddlex" / "official_models" / name,
+    ]
+    for path in candidates:
+        if path.exists():
+            return str(path)
+    logger.warning("PaddleOCR local model directory was not found: %s", candidates[0])
     return None
 
 
 @lru_cache(maxsize=1)
-def _get_ocr_engine() -> Any:
+def _get_gpu_ocr_engine() -> Any:
+    return _build_ocr_engine(prefer_gpu=True)
+
+
+@lru_cache(maxsize=1)
+def _get_cpu_ocr_engine() -> Any:
+    return _build_ocr_engine(prefer_gpu=False)
+
+
+def _build_ocr_engine(*, prefer_gpu: bool) -> Any:
     from paddleocr import PaddleOCR
+
+    use_gpu = prefer_gpu and settings.paddleocr_use_gpu
+    device = "gpu" if use_gpu else "cpu"
+    _log_ocr(f"initialize PaddleOCR device={device}")
 
     try:
         kwargs: dict[str, Any] = {
             "lang": settings.paddleocr_lang,
-            "device": "cpu",
+            "device": device,
             "use_doc_orientation_classify": False,
             "use_doc_unwarping": False,
             "use_textline_orientation": False,
@@ -82,7 +106,7 @@ def _get_ocr_engine() -> Any:
             "use_angle_cls": True,
             "lang": settings.paddleocr_lang,
             "show_log": False,
-            "use_gpu": settings.paddleocr_use_gpu,
+            "use_gpu": use_gpu,
             "enable_mkldnn": False,
             "ir_optim": False,
             "cpu_threads": 2,
@@ -125,7 +149,8 @@ def load_document_images(file_path: Path) -> list[Image.Image]:
 def _normalize_table_cell(value: Any) -> str:
     if value is None:
         return ""
-    return " ".join(str(value).replace("\u3000", " ").split())
+    normalized = unicodedata.normalize("NFKC", str(value))
+    return " ".join(normalized.replace("\u3000", " ").split())
 
 
 def _normalize_ocr_text(text: str) -> str:
@@ -179,6 +204,222 @@ def _looks_like_sparse_label_table(headers: list[str], rows: list[list[str]]) ->
                 column_non_empty[index] += 1
 
     return sum(1 for count in column_non_empty if count == 0) >= 1
+
+
+def _looks_like_repeating_shipping_request_table(headers: list[str], rows: list[list[str]]) -> bool:
+    all_rows = [headers, *rows]
+    joined = "\n".join(" ".join(_normalize_table_cell(cell) for cell in row) for row in all_rows)
+    return (
+        "車 番" in joined
+        and "引取可能" in joined
+        and "搬入希望" in joined
+        and "搬送目的" in joined
+        and sum(1 for row in all_rows if any(re.search(r"[A-Z]{2,}\d+[A-Z-]*", cell) for cell in row)) >= 2
+    )
+
+
+def _compact_row_text(row: list[str], start: int, end: int) -> str:
+    parts = [_normalize_table_cell(cell) for cell in row[start:end]]
+    return " ".join(part for part in parts if part)
+
+
+def _normalize_shipping_request_date(row: list[str], start: int) -> str:
+    # Typical vector cells are split like: '24/1 | 月 | 24 | 日.
+    parts = [_normalize_table_cell(cell) for cell in row[start : start + 4]]
+    compact = "".join(parts)
+    match = re.search(r"'?(\d{2})/(\d{1,2}).*?(\d{1,2})", compact)
+    if not match:
+        return _compact_row_text(row, start, start + 4)
+    year = 2000 + int(match.group(1))
+    month = int(match.group(2))
+    day = int(match.group(3))
+    return f"{year:04d}-{month:02d}-{day:02d}"
+
+
+def _normalize_repeating_shipping_request_table(table: ExtractedTable) -> ExtractedTable | None:
+    if not _looks_like_repeating_shipping_request_table(table.headers, table.rows):
+        return None
+
+    all_rows = [table.headers, *table.rows]
+    start_indexes = [
+        index
+        for index, row in enumerate(all_rows)
+        if len(row) > 1 and re.search(r"[A-Z]{3}\d{2}[A-Z]{2}-", _normalize_table_cell(row[1]))
+    ]
+    if not start_indexes:
+        return None
+
+    headers = [
+        "車型",
+        "車番",
+        "引取可能日時",
+        "所在場所",
+        "搬入希望日時",
+        "搬入場所",
+        "負担部署",
+        "支払い担当",
+        "保険",
+        "引渡担当",
+        "受領担当",
+        "搬送目的",
+        "特記事項",
+    ]
+    normalized_rows: list[list[str]] = []
+    for position, start_index in enumerate(start_indexes):
+        end_index = start_indexes[position + 1] if position + 1 < len(start_indexes) else len(all_rows)
+        block = all_rows[start_index:end_index]
+        if not block:
+            continue
+
+        model_row = block[0]
+        date_row = block[1] if len(block) > 1 else []
+        location_row = block[2] if len(block) > 2 else []
+        car_row = block[3] if len(block) > 3 else []
+        insurance_row = block[4] if len(block) > 4 else []
+        contact_row = block[5] if len(block) > 5 else []
+
+        vehicle_model = _normalize_table_cell(model_row[1] if len(model_row) > 1 else "")
+        car_number = _normalize_table_cell(car_row[1] if len(car_row) > 1 else "")
+        if not vehicle_model and not car_number:
+            continue
+
+        pickup_date = _normalize_shipping_request_date(model_row, 3)
+        pickup_time = _compact_row_text(date_row, 3, 6) if date_row else ""
+        delivery_date = _normalize_shipping_request_date(model_row, 8)
+        delivery_time = _compact_row_text(date_row, 8, 11) if date_row else ""
+
+        normalized_rows.append(
+            [
+                vehicle_model,
+                car_number,
+                " ".join(part for part in (pickup_date, pickup_time) if part),
+                _compact_row_text(location_row, 2, 7) if location_row else "",
+                " ".join(part for part in (delivery_date, delivery_time) if part),
+                _compact_row_text(location_row, 7, 12) if location_row else "",
+                _compact_row_text(model_row, 13, 15),
+                _compact_row_text(car_row, 12, 15) if car_row else "",
+                _compact_row_text(insurance_row, 15, 18) if insurance_row else "",
+                _compact_row_text(contact_row, 2, 5) if contact_row else "",
+                _compact_row_text(contact_row, 7, 10) if contact_row else "",
+                _compact_row_text(contact_row, 15, 18) if contact_row else "",
+                " / ".join(
+                    part
+                    for part in (
+                        _compact_row_text(model_row, 15, 18),
+                        _compact_row_text(date_row, 15, 18) if date_row else "",
+                    )
+                    if part
+                ),
+            ]
+        )
+
+    if not normalized_rows:
+        return None
+
+    return ExtractedTable(
+        page=table.page,
+        table_index=table.table_index,
+        bbox=table.bbox,
+        title="搬送依頼明細",
+        headers=headers,
+        rows=normalized_rows,
+    )
+
+
+def _find_cell_index(row: list[str], keyword: str) -> int | None:
+    for index, cell in enumerate(row):
+        if keyword in _normalize_table_cell(cell):
+            return index
+    return None
+
+
+def _find_first_matching_cell(rows: list[list[str]], pattern: str) -> str:
+    for row in rows:
+        for cell in row:
+            value = _normalize_table_cell(cell)
+            if re.search(pattern, value):
+                return value
+    return ""
+
+
+def _normalize_compact_shipping_request_table(table: ExtractedTable) -> ExtractedTable | None:
+    all_rows = [table.headers, *table.rows]
+    joined = "\n".join(" ".join(_normalize_table_cell(cell) for cell in row) for row in all_rows)
+    if not (
+        "車 型" in joined
+        and "車 番" in joined
+        and "所在場所" in joined
+        and "搬入場所" in joined
+        and "負担部署" in joined
+    ):
+        return None
+
+    model_row_index = next(
+        (
+            index
+            for index, row in enumerate(all_rows)
+            if any(re.search(r"[A-Z]{3}\d{2}[A-Z]{2}-", _normalize_table_cell(cell)) for cell in row)
+        ),
+        None,
+    )
+    if model_row_index is None:
+        return None
+
+    model_row = all_rows[model_row_index]
+    date_row = all_rows[model_row_index + 1] if model_row_index + 1 < len(all_rows) else []
+    location_row = next((row for row in all_rows if _find_cell_index(row, "所在場所") is not None or _find_cell_index(row, "搬入場所") is not None), [])
+    car_row = next((row for row in all_rows if _find_cell_index(row, "車 番") is not None), [])
+    insurance_row = next((row for row in all_rows if _find_cell_index(row, "保") is not None and _find_cell_index(row, "険") is not None), [])
+    purpose_row = next((row for row in all_rows if _find_cell_index(row, "搬送目的") is not None), [])
+
+    vehicle_model = _find_first_matching_cell(all_rows, r"[A-Z]{3}\d{2}[A-Z]{2}-")
+    car_number = _find_first_matching_cell(all_rows, r"[A-Z]{2,}\d{2}[-ーｰ－]\d{6,}")
+    if not vehicle_model and not car_number:
+        return None
+
+    pickup_index = _find_cell_index(model_row, "引取可能")
+    delivery_index = _find_cell_index(model_row, "搬入希望")
+    pickup_date = _normalize_shipping_request_date(model_row, pickup_index + 1) if pickup_index is not None else ""
+    pickup_time = _compact_row_text(date_row, pickup_index + 1, pickup_index + 4) if pickup_index is not None and date_row else ""
+    delivery_date = _normalize_shipping_request_date(model_row, delivery_index + 1) if delivery_index is not None else ""
+    delivery_time = _compact_row_text(date_row, delivery_index + 1, delivery_index + 4) if delivery_index is not None and date_row else ""
+
+    pickup_location_index = _find_cell_index(location_row, "所在場所") if location_row else None
+    delivery_location_index = _find_cell_index(location_row, "搬入場所") if location_row else None
+    pickup_location = _compact_row_text(location_row, pickup_location_index + 1, delivery_location_index or len(location_row)) if pickup_location_index is not None else ""
+    delivery_location = _compact_row_text(location_row, delivery_location_index + 1, 13) if delivery_location_index is not None else ""
+
+    department = _compact_row_text(model_row, 13, 15)
+    payment = _compact_row_text(car_row, 13, 15) if car_row else ""
+    insurance = _compact_row_text(insurance_row, 15, 18) if insurance_row else ""
+    purpose = _compact_row_text(purpose_row, 15, 18) if purpose_row else ""
+    special_notes = " / ".join(
+        part
+        for part in (
+            _compact_row_text(model_row, 15, len(model_row)),
+            _compact_row_text(date_row, 15, len(date_row)) if date_row else "",
+            insurance,
+            purpose,
+        )
+        if part
+    )
+
+    return ExtractedTable(
+        page=table.page,
+        table_index=table.table_index,
+        bbox=table.bbox,
+        title="搬送依頼明細",
+        headers=["車型・車番", "車両引取場所", "車両搬入先", "搬送費負担部署", "特記事項"],
+        rows=[
+            [
+                " / ".join(part for part in (vehicle_model, car_number) if part),
+                " / ".join(part for part in (" ".join(part for part in (pickup_date, pickup_time) if part), pickup_location) if part),
+                " / ".join(part for part in (" ".join(part for part in (delivery_date, delivery_time) if part), delivery_location) if part),
+                " / ".join(part for part in (department, payment) if part),
+                special_notes,
+            ]
+        ],
+    )
 
 
 def _coerce_page_number(raw_page: Any, fallback_page: int) -> int:
@@ -253,16 +494,19 @@ def _collect_vector_tables(file_path: Path) -> list[ExtractedTable]:
                 if _looks_like_sparse_label_table(headers, rows):
                     continue
                 bbox = [float(value) for value in getattr(table, "bbox", (0, 0, 0, 0))]
-
-                tables.append(
-                    ExtractedTable(
-                        page=page_index,
-                        table_index=table_index,
-                        bbox=bbox,
-                        headers=headers,
-                        rows=rows,
-                    )
+                extracted_table = ExtractedTable(
+                    page=page_index,
+                    table_index=table_index,
+                    bbox=bbox,
+                    headers=headers,
+                    rows=rows,
                 )
+                normalized_table = (
+                    _normalize_repeating_shipping_request_table(extracted_table)
+                    or _normalize_compact_shipping_request_table(extracted_table)
+                    or extracted_table
+                )
+                tables.append(normalized_table)
     finally:
         document.close()
 
@@ -1263,25 +1507,48 @@ def _run_remote_ocr(file_path: Path) -> list[OCRLine]:
 def run_ocr(file_path: Path) -> list[OCRLine]:
     if settings.remote_ocr_base_url.strip():
         try:
-            return _run_remote_ocr(file_path)
+            _log_ocr(f"remote OCR start file={file_path.name} base_url={settings.remote_ocr_base_url}")
+            lines = _run_remote_ocr(file_path)
+            _log_ocr(f"remote OCR done file={file_path.name} lines={len(lines)}")
+            return lines
         except Exception as exc:  # noqa: BLE001
             logger.warning("Remote OCR failed, fallback to local OCR: %s", exc)
+            _log_ocr(f"remote OCR failed; fallback to local file={file_path.name} error={exc}")
 
-    engine = _get_ocr_engine()
+    preferred_gpu = settings.paddleocr_use_gpu
+    if preferred_gpu:
+        try:
+            _log_ocr(f"local OCR start file={file_path.name} device=gpu")
+            return _run_local_ocr(file_path, _get_gpu_ocr_engine())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Local OCR GPU path failed, fallback to CPU: %s", exc)
+            _log_ocr(f"local OCR GPU failed; fallback to CPU file={file_path.name} error={exc}")
+
+    _log_ocr(f"local OCR start file={file_path.name} device=cpu")
+    return _run_local_ocr(file_path, _get_cpu_ocr_engine())
+
+
+def _run_local_ocr(file_path: Path, engine: Any) -> list[OCRLine]:
     use_modern_api = _uses_modern_predict_api(engine)
     all_lines: list[OCRLine] = []
-    for page_index, image in enumerate(load_document_images(file_path), start=1):
+    images = load_document_images(file_path)
+    _log_ocr(f"local OCR pages loaded file={file_path.name} pages={len(images)}")
+    for page_index, image in enumerate(images, start=1):
+        _log_ocr(f"local OCR page start file={file_path.name} page={page_index}/{len(images)} size={image.width}x{image.height}")
         prepared = preprocess_image(image)
         prepared_array = np.array(prepared)
+        before_count = len(all_lines)
         if hasattr(engine, "predict"):
             try:
                 results = engine.predict(prepared_array)
                 predicted_lines = _build_lines_from_predict(list(results), fallback_page=page_index)
                 if predicted_lines:
                     all_lines.extend(predicted_lines)
+                    _log_ocr(f"local OCR page done file={file_path.name} page={page_index}/{len(images)} lines={len(all_lines) - before_count}")
                     continue
             except Exception as exc:  # noqa: BLE001
                 logger.warning("PaddleOCR predict() failed, fallback to ocr(): %s", exc)
+                _log_ocr(f"PaddleOCR predict failed; retry ocr() file={file_path.name} page={page_index} error={exc}")
 
         try:
             if use_modern_api:
@@ -1297,7 +1564,11 @@ def run_ocr(file_path: Path) -> list[OCRLine]:
         predicted_lines = _build_lines_from_predict(list(result), fallback_page=page_index)
         if predicted_lines:
             all_lines.extend(predicted_lines)
+            _log_ocr(f"local OCR page done file={file_path.name} page={page_index}/{len(images)} lines={len(all_lines) - before_count}")
             continue
 
         all_lines.extend(_build_lines_from_legacy_ocr_result(result, fallback_page=page_index))
-    return sorted(all_lines, key=lambda line: (line.page, round(line.center_y, 1), line.left))
+        _log_ocr(f"local OCR page done file={file_path.name} page={page_index}/{len(images)} lines={len(all_lines) - before_count}")
+    sorted_lines = sorted(all_lines, key=lambda line: (line.page, round(line.center_y, 1), line.left))
+    _log_ocr(f"local OCR done file={file_path.name} lines={len(sorted_lines)}")
+    return sorted_lines
