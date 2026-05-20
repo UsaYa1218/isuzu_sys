@@ -11,7 +11,7 @@ from collections import defaultdict
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 import numpy as np
@@ -1504,37 +1504,57 @@ def _run_remote_ocr(file_path: Path) -> list[OCRLine]:
     return [OCRLine(**line) for line in raw_lines]
 
 
-def run_ocr(file_path: Path) -> list[OCRLine]:
+ProgressCallback = Callable[[str, float | None], None]
+
+
+def run_ocr(file_path: Path, progress_callback: ProgressCallback | None = None) -> list[OCRLine]:
+    def notify(message: str, percent: float | None = None) -> None:
+        if progress_callback:
+            progress_callback(message, percent)
+
     if settings.remote_ocr_base_url.strip():
         try:
             _log_ocr(f"remote OCR start file={file_path.name} base_url={settings.remote_ocr_base_url}")
+            notify(f"{file_path.name} リモートOCR中", 10)
             lines = _run_remote_ocr(file_path)
             _log_ocr(f"remote OCR done file={file_path.name} lines={len(lines)}")
+            notify(f"{file_path.name} OCR完了", 100)
             return lines
         except Exception as exc:  # noqa: BLE001
             logger.warning("Remote OCR failed, fallback to local OCR: %s", exc)
             _log_ocr(f"remote OCR failed; fallback to local file={file_path.name} error={exc}")
+            notify(f"{file_path.name} リモートOCR失敗、ローカルOCRへ切替", None)
 
     preferred_gpu = settings.paddleocr_use_gpu
     if preferred_gpu:
         try:
             _log_ocr(f"local OCR start file={file_path.name} device=gpu")
-            return _run_local_ocr(file_path, _get_gpu_ocr_engine())
+            notify(f"{file_path.name} GPU OCR初期化中", 3)
+            return _run_local_ocr(file_path, _get_gpu_ocr_engine(), progress_callback=progress_callback)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Local OCR GPU path failed, fallback to CPU: %s", exc)
             _log_ocr(f"local OCR GPU failed; fallback to CPU file={file_path.name} error={exc}")
+            notify(f"{file_path.name} GPU OCR失敗、CPUへ切替: {exc}", None)
 
     _log_ocr(f"local OCR start file={file_path.name} device=cpu")
-    return _run_local_ocr(file_path, _get_cpu_ocr_engine())
+    notify(f"{file_path.name} CPU OCR初期化中", 3)
+    return _run_local_ocr(file_path, _get_cpu_ocr_engine(), progress_callback=progress_callback)
 
 
-def _run_local_ocr(file_path: Path, engine: Any) -> list[OCRLine]:
+def _run_local_ocr(file_path: Path, engine: Any, progress_callback: ProgressCallback | None = None) -> list[OCRLine]:
+    def notify(message: str, percent: float | None = None) -> None:
+        if progress_callback:
+            progress_callback(message, percent)
+
     use_modern_api = _uses_modern_predict_api(engine)
     all_lines: list[OCRLine] = []
     images = load_document_images(file_path)
     _log_ocr(f"local OCR pages loaded file={file_path.name} pages={len(images)}")
+    notify(f"{file_path.name} ページ読込完了 10%", 10)
     for page_index, image in enumerate(images, start=1):
+        page_start_percent = 10 + ((page_index - 1) / max(len(images), 1)) * 80
         _log_ocr(f"local OCR page start file={file_path.name} page={page_index}/{len(images)} size={image.width}x{image.height}")
+        notify(f"{file_path.name} OCR中 {int(page_start_percent)}% ({page_index}/{len(images)}ページ)", page_start_percent)
         prepared = preprocess_image(image)
         prepared_array = np.array(prepared)
         before_count = len(all_lines)
@@ -1545,6 +1565,8 @@ def _run_local_ocr(file_path: Path, engine: Any) -> list[OCRLine]:
                 if predicted_lines:
                     all_lines.extend(predicted_lines)
                     _log_ocr(f"local OCR page done file={file_path.name} page={page_index}/{len(images)} lines={len(all_lines) - before_count}")
+                    page_done_percent = 10 + (page_index / max(len(images), 1)) * 80
+                    notify(f"{file_path.name} OCR中 {int(page_done_percent)}% ({page_index}/{len(images)}ページ完了)", page_done_percent)
                     continue
             except Exception as exc:  # noqa: BLE001
                 logger.warning("PaddleOCR predict() failed, fallback to ocr(): %s", exc)
@@ -1565,10 +1587,15 @@ def _run_local_ocr(file_path: Path, engine: Any) -> list[OCRLine]:
         if predicted_lines:
             all_lines.extend(predicted_lines)
             _log_ocr(f"local OCR page done file={file_path.name} page={page_index}/{len(images)} lines={len(all_lines) - before_count}")
+            page_done_percent = 10 + (page_index / max(len(images), 1)) * 80
+            notify(f"{file_path.name} OCR中 {int(page_done_percent)}% ({page_index}/{len(images)}ページ完了)", page_done_percent)
             continue
 
         all_lines.extend(_build_lines_from_legacy_ocr_result(result, fallback_page=page_index))
         _log_ocr(f"local OCR page done file={file_path.name} page={page_index}/{len(images)} lines={len(all_lines) - before_count}")
+        page_done_percent = 10 + (page_index / max(len(images), 1)) * 80
+        notify(f"{file_path.name} OCR中 {int(page_done_percent)}% ({page_index}/{len(images)}ページ完了)", page_done_percent)
     sorted_lines = sorted(all_lines, key=lambda line: (line.page, round(line.center_y, 1), line.left))
     _log_ocr(f"local OCR done file={file_path.name} lines={len(sorted_lines)}")
+    notify(f"{file_path.name} OCR完了 100%", 100)
     return sorted_lines

@@ -1,0 +1,158 @@
+# -*- mode: python ; coding: utf-8 -*-
+import importlib
+import sys
+from pathlib import Path
+
+from PyInstaller.utils.hooks import collect_all
+
+
+def collect_python_extension_modules(module_names):
+    collected = []
+    for module_name in module_names:
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:
+            continue
+        module_file = getattr(module, "__file__", None)
+        if not module_file:
+            continue
+        module_path = Path(module_file)
+        if module_path.suffix.lower() in {".pyd", ".dll"} and module_path.exists():
+            collected.append((str(module_path), "."))
+    return collected
+
+
+def collect_tk_dlls():
+    candidates = []
+    base_prefix = Path(sys.base_prefix)
+    prefix = Path(sys.prefix)
+    for root in (prefix, base_prefix):
+        candidates.extend([
+            root / "Library" / "bin" / "tcl86t.dll",
+            root / "Library" / "bin" / "tk86t.dll",
+            root / "DLLs" / "tcl86t.dll",
+            root / "DLLs" / "tk86t.dll",
+        ])
+    collected = []
+    seen = set()
+    for path in candidates:
+        if path.exists() and path.name.lower() not in seen:
+            collected.append((str(path), "."))
+            seen.add(path.name.lower())
+    return collected
+
+
+def collect_conda_library_dlls():
+    names = [
+        "libssl-3-x64.dll",
+        "libcrypto-3-x64.dll",
+        "libffi-8.dll",
+        "libffi-7.dll",
+        "ffi-8.dll",
+        "ffi-7.dll",
+        "ffi.dll",
+        "sqlite3.dll",
+        "libbz2.dll",
+        "zlib.dll",
+    ]
+    roots = [Path(sys.prefix), Path(sys.base_prefix)]
+    collected = []
+    seen = set()
+    for root in roots:
+        library_bin = root / "Library" / "bin"
+        for name in names:
+            path = library_bin / name
+            key = name.lower()
+            if path.exists() and key not in seen:
+                collected.append((str(path), "."))
+                seen.add(key)
+    return collected
+
+
+def collect_tcl_tk_data():
+    collected = []
+    for root in (Path(sys.prefix), Path(sys.base_prefix)):
+        library_lib = root / "Library" / "lib"
+        tcl_data = library_lib / "tcl8.6"
+        tk_data = library_lib / "tk8.6"
+        tcl_modules = library_lib / "tcl8"
+        if tcl_data.exists():
+            collected.append((str(tcl_data), "_tcl_data"))
+        if tk_data.exists():
+            collected.append((str(tk_data), "_tk_data"))
+        if tcl_modules.exists():
+            collected.append((str(tcl_modules), "tcl8"))
+    return collected
+
+
+datas = [('app\\templates', 'app\\templates'), ('app\\static', 'app\\static')]
+datas += collect_tcl_tk_data()
+binaries = []
+hiddenimports = [
+    'paddleocr',
+    'paddlex',
+    'cv2',
+    '_socket',
+    '_ssl',
+    '_hashlib',
+    '_bz2',
+    '_lzma',
+    '_ctypes',
+    '_decimal',
+    '_queue',
+    'select',
+]
+binaries += collect_python_extension_modules(hiddenimports)
+binaries += collect_tk_dlls()
+binaries += collect_conda_library_dlls()
+tmp_ret = collect_all('tkinterdnd2')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('paddleocr')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('paddlex')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('paddle')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+
+
+a = Analysis(
+    ['desktop_app.py'],
+    pathex=[],
+    binaries=binaries,
+    datas=datas,
+    hiddenimports=hiddenimports,
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[],
+    noarchive=False,
+    optimize=0,
+)
+pyz = PYZ(a.pure)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    [],
+    exclude_binaries=True,
+    name='TransferSummaryTool',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    console=False,
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+)
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name='TransferSummaryTool',
+)

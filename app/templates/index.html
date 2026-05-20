@@ -3,26 +3,79 @@
 {% block content %}
 <section class="hero">
   <div>
-    <p class="eyebrow">MVP</p>
-    <h1>伝票アップロードからレビュー、出力までを一気通し</h1>
+    <p class="eyebrow">陸送依頼書 OCR</p>
+    <h1>PDFを読み取り、必要な8項目だけをExcelへ出力します</h1>
     <p class="lede">
-      `deep-research-report.md` の方針に合わせて、OCR、LLM 正規化、Validation、
-      人手レビュー、Excel/CSV 出力をローカル完結でまとめた画面です。
+      複数ファイルをまとめて処理し、車型・車番、搬出入日時、搬出入場所、実行者、実行日時、読み取りファイル名だけを一覧化します。
     </p>
-    <p class="hero-meta">
-      <span class="pill">LLMモデル: {{ settings.ollama_model }}</span>
-    </p>
+    <div class="hero-meta">
+      <span class="pill">LLM: {{ settings.ollama_model }}</span>
+      <span class="pill">保存先: {{ settings.export_dir }}</span>
+    </div>
+  </div>
+</section>
+
+<section class="dashboard-grid">
+  <div class="metric-panel">
+    <span class="metric-label">登録ファイル</span>
+    <strong>{{ vouchers|length }}</strong>
+  </div>
+  <div class="metric-panel">
+    <span class="metric-label">現在の一括処理</span>
+    <strong>{{ current_batch_count }}</strong>
+  </div>
+  <div class="metric-panel">
+    <span class="metric-label">inbox</span>
+    <strong class="metric-path">{{ settings.inbox_dir }}</strong>
   </div>
 </section>
 
 <section class="panel">
-  <h2>新規 OCR 取込</h2>
+  <div class="panel-header">
+    <div>
+      <h2>一括取込</h2>
+      <p class="section-note">PDFまたは画像を inbox に置いてから実行します。複数ファイルは同じExcelにまとまります。</p>
+    </div>
+    <a class="ghost-button" href="/export/transfer-summary.xlsx">全件Excel</a>
+  </div>
+  <form action="/import/inbox" method="post" class="upload-form">
+    <label>
+      帳票種別
+      <select name="voucher_type">
+        <option value="delivery">陸送・納品系</option>
+        <option value="invoice">請求書</option>
+        <option value="journal">仕訳伝票</option>
+      </select>
+    </label>
+    <button type="submit">inboxから一括取込</button>
+  </form>
+</section>
+
+{% if current_batch_id %}
+<section class="panel warning-panel">
+  <div class="panel-header">
+    <div>
+      <h2>今回の一括処理</h2>
+      <p class="section-note">{{ current_batch_count }}件を同じExcelにまとめて出力できます。OCR処理中のファイルは完了後に反映されます。</p>
+    </div>
+    <a class="ghost-button" href="/export/transfer-summary.xlsx?batch_id={{ current_batch_id }}">今回分のExcel</a>
+  </div>
+</section>
+{% endif %}
+
+<section class="panel">
+  <div class="panel-header">
+    <div>
+      <h2>ファイルを選んで取込</h2>
+      <p class="section-note">手元のPDFや画像を直接選択して処理します。</p>
+    </div>
+  </div>
   <form action="/upload" method="post" enctype="multipart/form-data" class="upload-form">
     <label>
-      伝票種別
+      帳票種別
       <select name="voucher_type">
+        <option value="delivery">陸送・納品系</option>
         <option value="invoice">請求書</option>
-        <option value="delivery">納品書</option>
         <option value="journal">仕訳伝票</option>
       </select>
     </label>
@@ -30,15 +83,17 @@
       PDF / 画像
       <input type="file" name="files" accept=".pdf,.png,.jpg,.jpeg,.webp" multiple required />
     </label>
-    <p class="upload-help">複数ファイルをまとめて選択できます。複数選択時は一覧に戻り、各伝票を順番にOCR処理します。</p>
-    <button type="submit">OCR を開始する</button>
+    <button type="submit">OCRを開始</button>
   </form>
 </section>
 
 <section class="panel">
   <div class="panel-header">
-    <h2>伝票一覧</h2>
-    <span class="pill">{{ vouchers|length }} 件</span>
+    <div>
+      <h2>処理一覧</h2>
+      <p class="section-note">詳細画面で抽出結果を確認・修正できます。</p>
+    </div>
+    <span class="pill">{{ vouchers|length }}件</span>
   </div>
   <div class="table-wrap">
     <table>
@@ -47,9 +102,9 @@
           <th>ID</th>
           <th>種別</th>
           <th>状態</th>
-          <th>取引先</th>
-          <th>伝票番号</th>
-          <th>合計</th>
+          <th>読み取りファイル名</th>
+          <th>陸送行</th>
+          <th>一括Excel</th>
           <th>更新日時</th>
         </tr>
       </thead>
@@ -61,14 +116,27 @@
           <td>
             <span class="status status-{{ voucher.status|lower }}">{{ status_labels.get(voucher.status, voucher.status) }}</span>
           </td>
-          <td>{{ voucher.vendor_name or "-" }}</td>
-          <td>{{ voucher.document_number or "-" }}</td>
-          <td>{{ voucher.grand_total or "-" }} {{ voucher.currency or "" }}</td>
+          <td>{{ voucher.source_filename or "-" }}</td>
+          <td>
+            {% if voucher.transfer_record_count %}
+            {{ voucher.transfer_record_count }}件
+            {% if voucher.transfer_review_count %}<span class="pill review-pill">{{ voucher.transfer_review_count }}件 要確認</span>{% endif %}
+            {% else %}
+            -
+            {% endif %}
+          </td>
+          <td>
+            {% if voucher.batch_id %}
+            <a href="/export/transfer-summary.xlsx?batch_id={{ voucher.batch_id }}">Excel</a>
+            {% else %}
+            -
+            {% endif %}
+          </td>
           <td>{{ voucher.updated_at }}</td>
         </tr>
         {% else %}
         <tr>
-          <td colspan="7" class="empty">まだ伝票は登録されていません。</td>
+          <td colspan="7" class="empty">まだファイルは登録されていません。</td>
         </tr>
         {% endfor %}
       </tbody>

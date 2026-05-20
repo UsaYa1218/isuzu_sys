@@ -1,127 +1,166 @@
 # 伝票自動転記ツール
 
-`deep-research-report.md` を基にした、ローカル完結の伝票自動転記 MVP です。  
-`PaddleOCR` で OCR、`Ollama` で正規化補助を行い、レビュー後に `Excel` または `CSV(zip)` へ出力できます。
+PDF/画像の伝票をOCRとLLMで読み取り、陸送一覧Excelを作成するWindows向けツールです。
 
-## 構成
+最終的なExcelには以下の8項目だけを出力します。
 
-- バックエンド: `FastAPI`
-- OCR: `PaddleOCR`
-- PDF レンダリング: `PyMuPDF`
-- LLM: `Ollama`
-- 永続化: `SQLite`
-- UI: `Jinja2` テンプレート
+- 車型・車番
+- 搬出日時
+- 搬出場所
+- 搬入日時
+- 搬入場所
+- 実行者
+- 実行日時
+- 読み取りファイル名
 
-## できること
+## デスクトップアプリ
 
-- PDF / 画像をアップロードして OCR 実行
-- 伝票種別ごとに基本フィールドを抽出
-- LLM による数値 / 日付 / 表記ゆれの正規化補助
-- Validation による要確認判定
-- ブラウザ上でレビュー編集
-- `xlsx` と `csv(zip)` の出力
-- 最低限の監査ログ保持
+配布用アプリはブラウザを使わず、通常のWindowsアプリとして起動します。
 
-## セットアップ
+起動ファイル:
 
-Windows PowerShell を前提にしています。
+```text
+dist\TransferSummaryTool\TransferSummaryTool.exe
+```
+
+使い方:
+
+1. `TransferSummaryTool.exe` を起動します。
+2. PDFまたは画像ファイルをアプリ画面へドラッグ&ドロップします。
+3. `これらのファイルを処理` を押します。
+4. 処理完了後、Excelが `runtime\exports` に作成されます。
+
+画面にはOCRの進捗が表示されます。
+
+```text
+example.pdf OCR中 80% (2/3ページ完了)
+```
+
+画面下部の進捗バーは全体進捗を示し、近くに残り時間の目安を表示します。
+
+```text
+残り時間: 約2分30秒
+```
+
+## 初回起動
+
+初回起動時に以下を確認・準備します。
+
+- `runtime` 配下の作業フォルダ作成
+- GPU OCR環境の確認
+- Ollamaがインストールされている場合、設定されたLLMモデルの確認・pull
+
+GPU OCRは配布先PCの環境に合わせて判定します。
+
+- `nvidia-smi` でNVIDIA GPUとCUDAバージョンを確認
+- CUDA 12.6以上: `cu126` 用の `paddlepaddle-gpu==3.2.0` を導入
+- CUDA 11.8以上: `cu118` 用の `paddlepaddle-gpu==3.2.0` を導入
+- 対応GPU/CUDAが見つからない場合はCPU OCRへフォールバック
+
+GPU版ライブラリは以下へ追加導入され、アプリ起動時に優先利用されます。
+
+```text
+runtime\python_packages
+```
+
+初回GPUライブラリ導入には、配布先PCにインターネット接続とPythonが必要です。
+
+## 設定
+
+アプリと同じフォルダの `.env` で設定できます。
+
+主な項目:
+
+```env
+APP_NAME=伝票自動転記ツール
+PADDLEOCR_USE_GPU=true
+OLLAMA_BASE_URL=http://127.0.0.1:11434
+OLLAMA_MODEL=qwen3:14b
+OLLAMA_API_STYLE=ollama
+OLLAMA_THINK=false
+```
+
+`PADDLEOCR_USE_GPU=true` が既定です。GPU環境が使えない場合は自動でCPUに切り替わります。
+
+## フォルダ
+
+```text
+runtime\inbox            一括取込用のPDF/画像置き場
+runtime\processed        inbox取込済みファイルの移動先
+runtime\uploads          アプリ内部の保存先
+runtime\exports          Excel出力先
+runtime\python_packages  初回起動時に追加導入するGPUライブラリ
+runtime\app.db           処理履歴のSQLiteデータベース
+```
+
+## 開発環境セットアップ
+
+```cmd
+cd solution3
+setup.cmd
+```
+
+CPU版PaddlePaddleでセットアップしたい場合:
+
+```cmd
+setup.cmd -UseCpuPaddle
+```
+
+PowerShellで実行する場合:
 
 ```powershell
 cd solution3
 .\setup.ps1
 ```
 
-`setup.ps1` が行うこと:
+## Web版の起動
 
-1. `winget` が使える場合に Python / Ollama を導入
-2. `.venv` 作成
-3. 依存ライブラリ導入
-4. 公式の CPU wheel から `paddlepaddle==3.2.0` を導入
-5. `.env` 作成
-6. `runtime/` 初期化
-7. 既定モデル `qwen2.5:7b` を `ollama pull`
-
-既に Python / Ollama を導入済みなら、インストーラ部分を飛ばせます。
-
-```powershell
-.\setup.ps1 -SkipInstaller
-```
-
-## 起動
-
-```powershell
-cd solution3
-.\run.ps1
-```
-
-起動後、ブラウザで `http://127.0.0.1:8000` を開いてください。
-
-PowerShell の実行ポリシーで `.ps1` が止まる環境では、`cmd` ラッパーを使ってください。
+開発用のWeb UIも残しています。
 
 ```cmd
-cd solution3
 run.cmd
 ```
 
-一時的に PowerShell 側で回避するなら、現在のシェルだけ実行ポリシーを緩めれば足ります。
+起動後、ブラウザで以下を開きます。
 
-```powershell
-Set-ExecutionPolicy -Scope Process Bypass
-.\run.ps1
+```text
+http://127.0.0.1:8000
 ```
 
-## 設定
+## 配布パッケージ作成
 
-`.env` の主な項目:
+GUI版の配布パッケージを作る場合:
 
-- `OCR_DPI`: PDF を画像化する解像度。既定 `300`
-- `OCR_CONFIDENCE_THRESHOLD`: 要確認閾値。既定 `0.75`
-- `PADDLEOCR_LANG`: 既定 `japan`
-- `OLLAMA_BASE_URL`: 既定 `http://127.0.0.1:11434`
-- `OLLAMA_MODEL`: 既定 `qwen2.5:7b`
-- `OLLAMA_HEADERS_JSON`: 外部 Ollama に追加したい HTTP ヘッダー。JSON object 文字列
-- `OLLAMA_GENERATE_OPTIONS_JSON`: Ollama API の `options` に渡す JSON object 文字列
+```cmd
+build_windows_package.cmd
+```
 
-## Colab 連携
+出力先:
 
-Colab の Computing Unit を使って LLM だけを外出しできます。  
-ローカルアプリはそのまま動かし、`OLLAMA_BASE_URL` だけ Colab 側に向けます。
+```text
+dist\TransferSummaryTool
+```
 
-最短手順:
+配布時は `dist\TransferSummaryTool` フォルダごと渡してください。
 
-1. Colab でこのリポジトリを clone
-2. `colab/start_ollama_colab.py` を開き、`#%%` セルを上から順に実行
-3. 出力された `public_base_url` をローカル `.env` の `OLLAMA_BASE_URL` に設定
-4. ローカルで `run.cmd` を起動
+## テストデータでExcel生成
 
-詳細は [docs/colab-ollama.md](docs/colab-ollama.md) を参照してください。
+OCRキャッシュ済みのテストデータからExcelを生成できます。
 
-## 画面 / API
+```cmd
+.\.venv\Scripts\python.exe scripts\export_transfer_summary_from_testdata.py
+```
 
-- `/` 取込と一覧
-- `/vouchers/{voucher_id}` レビューと出力
-- `/api/v1/vouchers` 一覧取得
-- `/api/v1/vouchers/{voucher_id}` 詳細取得
+出力先:
 
-## 実装上の前提
+```text
+runtime\exports
+```
 
-- OCR は `PaddleOCR` を単一エンジンとして使用
-- 非同期ジョブは MVP として `FastAPI BackgroundTasks` で実装
-- 伝票テンプレート管理は、まずコード内のラベル辞書ベース
-- 抽出精度が不十分な項目は `REVIEW_REQUIRED` に落とす方針
-- LLM は正規化支援のみで、OCR に無い情報を埋めない前提
+## 注意
 
-## 運用上の注意
-
-- `PaddleOCR` / `paddlepaddle` の Windows 導入可否は環境差があるため、セットアップ時に失敗した場合は公式の CPU wheel 手順に合わせて再導入してください。
-- 現在のセットアップは PaddleOCR 公式インストールページと FAQ に合わせ、`paddlepaddle==3.2.0` / `paddleocr==3.2.0` を前提にしています。これは公式 docs の CPU pip 例と、依存衝突時に特定バージョンを使う FAQ を踏まえた構成です。
-- `Ollama` が起動していない場合でもアプリは動きますが、LLM 正規化はスキップされます。
-- `runtime/app.db` に SQLite が作られ、原本は `runtime/uploads`、出力は `runtime/exports` に保存されます。
-
-## 今後の拡張候補
-
-- テンプレート定義 UI
-- 承認段階の条件分岐
-- freee / マネーフォワード向けコネクタ
-- ジョブキューの外出し
-- 監査ログの WORM / ハッシュチェーン化
+- LLM抽出にはOllamaまたはOpenAI互換APIが必要です。
+- Ollamaをローカルで使う場合は、アプリ起動前にOllamaを起動してください。
+- 初回GPUライブラリ導入は時間がかかる場合があります。
+- GPU OCRにはNVIDIA GPU、対応ドライバ、対応CUDA環境が必要です。
+- GPU OCRが失敗した場合でも、処理はCPU OCRへフォールバックします。

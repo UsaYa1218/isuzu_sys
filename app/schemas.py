@@ -52,6 +52,21 @@ class VoucherItemDraft:
 
 
 @dataclass(slots=True)
+class TransferRecordDraft:
+    vehicle_model: str | None = None
+    vehicle_number: str | None = None
+    pickup_datetime: str | None = None
+    pickup_location: str | None = None
+    delivery_datetime: str | None = None
+    delivery_location: str | None = None
+    confidence: float = 0.0
+    needs_review: bool = True
+    review_status: str = "NEEDS_REVIEW"
+    notes: str | None = None
+    validation_json: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
 class ContextHint:
     kind: str
     value: str

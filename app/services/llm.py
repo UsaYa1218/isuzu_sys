@@ -311,6 +311,46 @@ def _table_reconstruction_response_schema() -> dict[str, Any]:
     }
 
 
+def _transfer_rows_response_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["rows", "warnings"],
+        "properties": {
+            "rows": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": [
+                        "vehicle_label",
+                        "vehicle_model",
+                        "vehicle_number",
+                        "pickup_datetime",
+                        "pickup_location",
+                        "delivery_datetime",
+                        "delivery_location",
+                        "confidence",
+                        "notes",
+                    ],
+                    "properties": {
+                        "vehicle_label": {"type": ["string", "null"]},
+                        "vehicle_model": {"type": ["string", "null"]},
+                        "vehicle_number": {"type": ["string", "null"]},
+                        "pickup_datetime": {"type": ["string", "null"]},
+                        "pickup_location": {"type": ["string", "null"]},
+                        "delivery_datetime": {"type": ["string", "null"]},
+                        "delivery_location": {"type": ["string", "null"]},
+                        "confidence": {"type": ["number", "null"]},
+                        "notes": {"type": ["string", "null"]},
+                    },
+                },
+            },
+            "warnings": {"type": "array", "items": {"type": "string"}},
+        },
+    }
+
+
 def _generate_json_via_ollama(
     prompt: str,
     *,
@@ -603,6 +643,55 @@ OCR text:
 """.strip()
 
 
+def _transfer_rows_prompt(source_filename: str, raw_text: str, tables: list[dict[str, Any]]) -> str:
+    return f"""
+You extract vehicle transport rows for an Excel workbook from Japanese OCR text and tables.
+
+Rules:
+- Output one row per vehicle.
+- Do not invent values. Unknown fields must be null.
+- Fill only these Excel concepts: vehicle label, pickup datetime, pickup location, delivery datetime, delivery location.
+- `vehicle_label` should be model and vehicle/VIN/chassis number joined like `MODEL / NUMBER` when both are present.
+- `vehicle_model` is the model/type such as `NPR88AN-HZ5AY-D`.
+- `vehicle_number` is the VIN/chassis/registration/control number such as `NPR88-7029623`.
+- For pickup_location and delivery_location, include only site/company/facility name and address.
+- Never put a person's name, contact person, requester, driver, receptionist, phone number, TEL/FAX, or email address in pickup_location or delivery_location.
+- If a location cell contains both a place and a person/contact, keep the place/address and omit the person/contact part.
+- If a FROM/TO table has separate rows for name/address/TEL, concatenate the relevant column values into one string for each location.
+- For wide request forms, use the same vehicle block: date header row + time row + location row + vehicle number row.
+- Do not put labels such as `期日`, `所在地`, `搬入場所`, `引取可能`, `搬入希望` in values unless they are part of a proper name.
+- Use the original date/time text when it is clearer than ISO. Do not output phone numbers as datetime.
+- Put uncertainty or source notes in `notes`.
+- Return JSON only.
+
+JSON shape:
+{{
+  "rows": [
+    {{
+      "vehicle_label": null,
+      "vehicle_model": null,
+      "vehicle_number": null,
+      "pickup_datetime": null,
+      "pickup_location": null,
+      "delivery_datetime": null,
+      "delivery_location": null,
+      "confidence": 0.0,
+      "notes": null
+    }}
+  ],
+  "warnings": []
+}}
+
+Source filename: {source_filename}
+
+Detected tables:
+{json.dumps(tables, ensure_ascii=False, indent=2)}
+
+OCR text:
+{raw_text}
+""".strip()
+
+
 def normalize_with_ollama(
     voucher_type: str,
     raw_text: str,
@@ -626,4 +715,18 @@ def reconstruct_tables_with_ollama(
         _table_reconstruction_prompt(voucher_type, raw_text, heuristic_tables),
         response_schema=_table_reconstruction_response_schema(),
         required_top_level_keys={"tables", "items", "warnings"},
+    )
+
+
+def extract_transfer_rows_with_ollama(
+    source_filename: str,
+    raw_text: str,
+    tables: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, str | None, bool]:
+    if not raw_text.strip() and not tables:
+        return None, None, False
+    return _generate_json(
+        _transfer_rows_prompt(source_filename, raw_text, tables),
+        response_schema=_transfer_rows_response_schema(),
+        required_top_level_keys={"rows", "warnings"},
     )

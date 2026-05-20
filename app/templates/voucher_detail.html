@@ -19,10 +19,12 @@
       {% endif %}
     </p>
   </div>
+  {% if not demo_empty_result %}
   <div class="action-row">
     <a class="ghost-button" href="/vouchers/{{ voucher.id }}/export/xlsx">Excel出力</a>
     <a class="ghost-button" href="/vouchers/{{ voucher.id }}/export/csv">CSV(zip)出力</a>
   </div>
+  {% endif %}
 </section>
 
 {% if validation.warnings %}
@@ -39,7 +41,7 @@
 {% if source_preview_kind %}
 <section class="panel preview-panel">
   <div class="panel-header">
-    <h2>元PDF / 画像</h2>
+    <h2>PDFレビュー</h2>
     <a class="ghost-button" href="{{ source_preview_url }}" target="_blank" rel="noopener noreferrer">別タブで開く</a>
   </div>
   {% if source_preview_kind == "pdf" %}
@@ -48,12 +50,24 @@
   <img class="source-preview-image" src="{{ source_preview_url }}" alt="元画像プレビュー" />
   {% endif %}
 </section>
+{% elif demo_empty_result %}
+<section class="panel preview-panel">
+  <div class="panel-header">
+    <h2>PDFレビュー</h2>
+    <span class="pill review-pill">実PDFなし</span>
+  </div>
+  <div class="pdf-placeholder">
+    <p class="eyebrow">Sample</p>
+    <h3>中間報告用の空データ表示</h3>
+    <p>実際のPDFは使用せず、抽出対象項目と空欄の表示状態だけを確認するための画面です。</p>
+  </div>
+</section>
 {% endif %}
 
 {% if tables %}
 <section class="panel">
   <div class="panel-header">
-    <h2>抽出された表</h2>
+    <h2>抽出した表</h2>
     <span class="pill">{{ tables|length }}件</span>
   </div>
   {% for table in tables %}
@@ -220,9 +234,67 @@
         </div>
       </section>
 
+      <section class="form-section">
+        <div class="panel-header compact">
+          <div>
+            <h3>陸送情報</h3>
+            <p class="section-note">車種・車番・引取/搬入の日時と場所を確認します。</p>
+          </div>
+          <button type="button" class="ghost-button" data-add-transfer-row>陸送行を追加</button>
+        </div>
+
+        <div class="table-wrap">
+          <table id="transfer-table">
+            <thead>
+              <tr>
+                <th>車種</th>
+                <th>車番/VIN</th>
+                <th>引取日時</th>
+                <th>引取場所</th>
+                <th>搬入日時</th>
+                <th>搬入場所</th>
+                <th>備考</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for record in voucher.transfer_records %}
+              <tr>
+                <td>
+                  <input type="hidden" name="transfer_id" value="{{ record.id }}" />
+                  <input name="transfer_vehicle_model" value="{{ record.vehicle_model or '' }}" />
+                </td>
+                <td><input name="transfer_vehicle_number" value="{{ record.vehicle_number or '' }}" /></td>
+                <td><input name="transfer_pickup_datetime" value="{{ record.pickup_datetime or '' }}" /></td>
+                <td><input name="transfer_pickup_location" value="{{ record.pickup_location or '' }}" /></td>
+                <td><input name="transfer_delivery_datetime" value="{{ record.delivery_datetime or '' }}" /></td>
+                <td><input name="transfer_delivery_location" value="{{ record.delivery_location or '' }}" /></td>
+                <td><input name="transfer_notes" value="{{ record.notes or '' }}" /></td>
+              </tr>
+              {% endfor %}
+              {% if not voucher.transfer_records %}
+              <tr>
+                <td>
+                  <input type="hidden" name="transfer_id" value="" />
+                  <input name="transfer_vehicle_model" value="" />
+                </td>
+                <td><input name="transfer_vehicle_number" value="" /></td>
+                <td><input name="transfer_pickup_datetime" value="" /></td>
+                <td><input name="transfer_pickup_location" value="" /></td>
+                <td><input name="transfer_delivery_datetime" value="" /></td>
+                <td><input name="transfer_delivery_location" value="" /></td>
+                <td><input name="transfer_notes" value="" /></td>
+              </tr>
+              {% endif %}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      {% if not demo_empty_result %}
       <div class="action-row">
         <button type="submit">確認内容を保存</button>
       </div>
+      {% endif %}
     </form>
   </section>
 
@@ -277,6 +349,7 @@
     </div>
     {% endif %}
 
+    {% if not demo_empty_result %}
     <h2>状態変更</h2>
     <form action="/vouchers/{{ voucher.id }}/transition" method="post" class="stack">
       <button type="submit" name="action" value="submit">承認待ちにする</button>
@@ -284,6 +357,7 @@
       <button type="submit" name="action" value="reject" class="danger">差戻しにする</button>
       <button type="submit" name="action" value="reopen" class="ghost-button">レビューに戻す</button>
     </form>
+    {% endif %}
 
     <h2>監査ログ</h2>
     <div class="audit-list">

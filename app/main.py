@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from mimetypes import guess_type
+import re
 import shutil
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -23,14 +24,17 @@ from .database import (
     init_db,
     insert_voucher,
     now_iso,
+    replace_transfer_records,
     update_status,
+    update_transfer_records,
     update_voucher,
 )
-from .services.exporter import export_voucher_csv_zip, export_voucher_xlsx
+from .services.exporter import export_transfer_summary_xlsx, export_voucher_csv_zip, export_voucher_xlsx
 from .services.extraction import FIELD_SPECS, extract_document
+from .services.llm import extract_transfer_rows_with_ollama
 from .services.ocr_pipeline import extract_tables, run_ocr
 from .services.validation import validate_extraction
-from .schemas import ExtractedField, ExtractionResult, VoucherItemDraft
+from .schemas import ExtractedField, ExtractionResult, ExtractedTable, TransferRecordDraft, VoucherItemDraft
 
 
 app = FastAPI(title=settings.app_name)
@@ -39,6 +43,7 @@ app.mount("/static", StaticFiles(directory=str(settings.static_dir)), name="stat
 init_db()
 OCR_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ocr-worker")
 OCR_FUTURES: set[Future[None]] = set()
+SUPPORTED_INPUT_SUFFIXES = {".pdf", ".png", ".jpg", ".jpeg", ".webp"}
 
 VOUCHER_TYPE_LABELS = {
     "invoice": "請求書 / 依頼票",
@@ -69,6 +74,86 @@ FIELD_LABELS = {
     "grand_total": "合計金額",
     "notes": "備考",
 }
+
+
+def _empty_review_demo_voucher() -> dict[str, Any]:
+    fields = {
+        key: asdict(
+            ExtractedField(
+                key=key,
+                value=None,
+                raw_text=None,
+                confidence=0.0,
+                bbox=None,
+                needs_review=True,
+                source="demo",
+            )
+        )
+        for key in FIELD_LABELS
+    }
+    empty_item = {
+        "id": "",
+        "description": "",
+        "quantity": None,
+        "unit": None,
+        "unit_price": None,
+        "amount": None,
+        "tax_rate": None,
+        "confidence": 0.0,
+        "needs_review": True,
+    }
+    return {
+        "id": "demo_empty_review",
+        "type": "invoice",
+        "status": "REVIEW_REQUIRED",
+        "needs_review": True,
+        "source_filename": "中間報告用サンプル（実PDFなし）",
+        "source_path": "",
+        "issue_date": None,
+        "due_date": None,
+        "document_number": None,
+        "vendor_name": None,
+        "customer_name": None,
+        "currency": None,
+        "subtotal": None,
+        "tax": None,
+        "discount": None,
+        "grand_total": None,
+        "confidence": 0.0,
+        "notes": None,
+        "items": [empty_item],
+        "transfer_records": [],
+        "document_json": {
+            "voucher_type": "invoice",
+            "fields": fields,
+            "items": [empty_item],
+            "warnings": ["中間報告用の空データです。抽出対象項目は暫定のため今後変更されます。"],
+            "raw_text": "",
+            "ocr_lines": [],
+            "tables": [
+                {
+                    "page": 1,
+                    "table_index": 1,
+                    "bbox": [],
+                    "title": "抽出した表（空データ）",
+                    "headers": ["内容", "数量", "単位", "単価", "金額", "税率"],
+                    "rows": [["", "", "", "", "", ""]],
+                }
+            ],
+            "context_hints": [],
+            "llm_used": False,
+            "llm_status": "unused",
+            "llm_messages": [],
+        },
+        "validation_json": {
+            "status": "REVIEW_REQUIRED",
+            "needs_review": True,
+            "warnings": ["中間報告用の空データです。抽出対象項目は暫定のため今後変更されます。"],
+        },
+        "audit_logs": [],
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+    }
 
 
 def _new_id(prefix: str) -> str:
@@ -108,6 +193,531 @@ def _serialize_items_for_db(voucher_id: str, items: list[dict[str, Any]]) -> lis
             }
         )
     return serialized
+
+
+def _validate_transfer_record(record: TransferRecordDraft) -> dict[str, Any]:
+    warnings: list[str] = []
+    if not record.vehicle_model and not record.vehicle_number:
+        warnings.append("車種または車両番号を確認してください。")
+    if not record.pickup_location:
+        warnings.append("引取場所を確認してください。")
+    if not record.delivery_location:
+        warnings.append("搬入場所を確認してください。")
+    if record.confidence < settings.ocr_confidence_threshold:
+        warnings.append("陸送情報の信頼度が低いため確認してください。")
+    return {"warnings": warnings, "needs_review": bool(warnings)}
+
+
+def _serialize_transfer_records(records: list[TransferRecordDraft]) -> list[dict[str, Any]]:
+    serialized: list[dict[str, Any]] = []
+    for record in records:
+        validation = record.validation_json or _validate_transfer_record(record)
+        needs_review = bool(validation.get("needs_review", record.needs_review))
+        serialized.append(
+            {
+                "id": _new_id("tr"),
+                "vehicle_model": record.vehicle_model,
+                "vehicle_number": record.vehicle_number,
+                "pickup_datetime": record.pickup_datetime,
+                "pickup_location": record.pickup_location,
+                "delivery_datetime": record.delivery_datetime,
+                "delivery_location": record.delivery_location,
+                "confidence": record.confidence,
+                "needs_review": needs_review,
+                "review_status": "NEEDS_REVIEW" if needs_review else "AUTO_REVIEWED",
+                "notes": record.notes,
+                "validation_json": validation,
+            }
+        )
+    return serialized
+
+
+def _tables_for_transfer_llm(tables: list[ExtractedTable]) -> list[dict[str, Any]]:
+    return [
+        {
+            "page": table.page,
+            "table_index": table.table_index,
+            "title": table.title,
+            "headers": table.headers,
+            "rows": table.rows,
+        }
+        for table in tables
+    ]
+
+
+def _clean_transfer_cell(value: Any) -> str:
+    return str(value or "").replace("\u3000", " ").strip()
+
+
+def _sanitize_transfer_location(value: Any) -> str | None:
+    text = _clean_transfer_cell(value)
+    if not text:
+        return None
+
+    text = re.sub(r"\b(?:TEL|FAX|PHONE)\s*[:：]?\s*\d[\d\s()（）+\-－ー]*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", "", text)
+    text = re.sub(
+        r"(?:ご?担当者?|担当|受付|窓口|連絡先|依頼者|ドライバー|運転者|CONTACT|ATTN)\s*[:：]?\s*[^,，/／;；\n\r]*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"[^\s,，/／;；]+(?:様|さん|氏)", "", text)
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"\s*([,，/／;；])\s*", r"\1", text).strip(" ,，/／;；")
+    if not text or _looks_like_person_only_location(text):
+        return None
+    return text
+
+
+def _looks_like_person_only_location(value: Any) -> bool:
+    text = _clean_transfer_cell(value)
+    if not text:
+        return False
+    if any(
+        marker in text
+        for marker in (
+            "〒",
+            "株式会社",
+            "有限会社",
+            "合同会社",
+            "工場",
+            "営業所",
+            "センター",
+            "ヤード",
+            "車体",
+            "試験場",
+            "作業",
+            "港",
+            "倉庫",
+            "都",
+            "道",
+            "府",
+            "県",
+            "市",
+            "区",
+            "町",
+            "村",
+            "丁目",
+            "番地",
+            "号",
+        )
+    ):
+        return False
+    if re.search(r"(?:担当|受付|窓口|依頼者|ドライバー|運転者|様|さん|氏)", text):
+        return True
+    normalized = re.sub(r"[\s　]+", "", text)
+    return bool(re.fullmatch(r"[一-龥ぁ-ん]{2,10}", normalized))
+
+
+def _join_location_parts(parts: list[str]) -> str | None:
+    cleaned = []
+    seen = set()
+    for part in parts:
+        normalized = _sanitize_transfer_location(part)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        cleaned.append(normalized)
+    return " ".join(cleaned) if cleaned else None
+
+
+def _join_nonempty_cells(cells: list[Any]) -> str | None:
+    return _join_location_parts([_clean_transfer_cell(cell) for cell in cells])
+
+
+def _join_transfer_value_cells(cells: list[Any], skip_tokens: set[str], *, skip_vehicle_like: bool = False) -> str | None:
+    values = []
+    for cell in cells:
+        value = _clean_transfer_cell(cell)
+        if not value:
+            continue
+        if any(token in value for token in skip_tokens):
+            continue
+        if any(token in value for token in ("希望", "期", "車 型", "車型", "所在地", "所在場所", "搬入場所", "搬⼊場所")):
+            continue
+        if skip_vehicle_like and _looks_like_vehicle_value(value) and not re.search(r"\d{1,2}\s*(月|日|:)", value):
+            continue
+        values.append(value)
+    return _join_location_parts(values)
+
+
+def _looks_like_location_table(table: ExtractedTable) -> bool:
+    if len(table.headers) < 3:
+        return False
+    table_text = " ".join(_clean_transfer_cell(cell) for row in [table.headers, *table.rows] for cell in row)
+    if len(table.headers) > 5 and any(token in table_text for token in ("引取可能", "搬入希望", "搬⼊希望")):
+        return False
+    rows = table.rows or []
+    has_tel = any(any("TEL" in _clean_transfer_cell(cell).upper() for cell in row) for row in rows)
+    has_from_to = any(
+        token in _clean_transfer_cell(header).upper()
+        for header in table.headers
+        for token in ("FROM", "TO")
+    )
+    compact_rows = " ".join(_clean_transfer_cell(cell) for row in rows for cell in row)
+    return has_from_to or has_tel or ("住所" in compact_rows and ("名称" in compact_rows or "場所" in compact_rows))
+
+
+def _extract_location_pair_from_tables(tables: list[ExtractedTable]) -> tuple[str | None, str | None]:
+    for table in tables:
+        if len(table.headers) >= 3 and "出発地" in _clean_transfer_cell(table.headers[0]):
+            pickup = _sanitize_transfer_location(table.headers[2])
+            delivery = None
+            for row in table.rows:
+                if len(row) >= 3 and "到着地" in _clean_transfer_cell(row[0]):
+                    delivery = _sanitize_transfer_location(row[2])
+                    break
+            if pickup or delivery:
+                return pickup or None, delivery or None
+        if not _looks_like_location_table(table):
+            continue
+        pickup_parts: list[str] = []
+        delivery_parts: list[str] = []
+        for row in table.rows:
+            if len(row) < 3:
+                continue
+            label = _clean_transfer_cell(row[0]).upper()
+            if (
+                "備考" in label
+                or "NOTE" in label
+                or any(token in label for token in ("担当", "担当者", "受付", "窓口", "連絡先", "依頼者", "TEL", "FAX", "CONTACT", "ATTN"))
+            ):
+                continue
+            pickup_value = _sanitize_transfer_location(row[1])
+            delivery_value = _sanitize_transfer_location(row[2])
+            if pickup_value:
+                pickup_parts.append(pickup_value)
+            if delivery_value:
+                delivery_parts.append(delivery_value)
+        pickup = _join_location_parts(pickup_parts)
+        delivery = _join_location_parts(delivery_parts)
+        if pickup or delivery:
+            return pickup, delivery
+    return None, None
+
+
+def _extract_transfer_dates_from_tables(tables: list[ExtractedTable]) -> tuple[str | None, str | None]:
+    def looks_like_phone(value: str) -> bool:
+        normalized = _clean_transfer_cell(value)
+        return bool(re.fullmatch(r"(TEL[:：]?\s*)?\d{2,5}-\d{1,4}-\d{3,4}", normalized, flags=re.IGNORECASE))
+
+    def looks_like_date(value: str) -> bool:
+        normalized = _clean_transfer_cell(value)
+        if not normalized:
+            return False
+        if normalized.upper().startswith("TEL") or looks_like_phone(normalized):
+            return False
+        if re.search(r"\d{4}[/-]\d{1,2}[/-]\d{1,2}", normalized):
+            return True
+        if re.search(r"\d{1,2}\s*月\s*\d{1,2}\s*日", normalized):
+            return True
+        if re.search(r"\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日", normalized):
+            return True
+        if re.search(r"\d{4}[/-]\d{1,2}[/-]\d{1,2}\s*(AM|PM)?", normalized, flags=re.IGNORECASE):
+            return True
+        return False
+
+    pickup_date = None
+    delivery_date = None
+    for table in tables:
+        if len(table.headers) >= 3 and "出発地" in _clean_transfer_cell(table.headers[0]):
+            for row in table.rows:
+                if len(row) < 3:
+                    continue
+                label = _clean_transfer_cell(row[1])
+                value = _clean_transfer_cell(row[2])
+                if "搬出日時" in label and value:
+                    pickup_date = value
+                if "搬入日時" in label and value:
+                    delivery_date = value
+        for row in table.rows:
+            if len(row) >= 2:
+                label = _clean_transfer_cell(row[0])
+                value = _clean_transfer_cell(row[1])
+                label_is_schedule = any(token in label for token in ("輸送予定日", "予定日", "アレンジ日", "搬出日", "納期"))
+                if label_is_schedule and looks_like_date(value):
+                    pickup_date = pickup_date or value
+                    delivery_date = delivery_date or value
+                    continue
+            if len(row) < 3:
+                continue
+            first_cell = _clean_transfer_cell(row[0])
+            if "TEL" in first_cell.upper():
+                continue
+            pickup_candidate = _clean_transfer_cell(row[1])
+            delivery_candidate = _clean_transfer_cell(row[2])
+            if not looks_like_date(pickup_candidate) and not looks_like_date(delivery_candidate):
+                continue
+            if looks_like_date(pickup_candidate):
+                pickup_date = pickup_candidate
+            if looks_like_date(delivery_candidate):
+                delivery_date = delivery_candidate
+    return pickup_date, delivery_date
+
+
+def _enrich_transfer_records_from_tables(records: list[dict[str, Any]], extraction: ExtractionResult) -> list[dict[str, Any]]:
+    pickup_location, delivery_location = _extract_location_pair_from_tables(extraction.tables)
+    pickup_datetime, delivery_datetime = _extract_transfer_dates_from_tables(extraction.tables)
+    for record in records:
+        existing_pickup_location = _sanitize_transfer_location(record.get("pickup_location"))
+        existing_delivery_location = _sanitize_transfer_location(record.get("delivery_location"))
+        record["pickup_location"] = existing_pickup_location
+        record["delivery_location"] = existing_delivery_location
+        if pickup_location and not existing_pickup_location:
+            record["pickup_location"] = pickup_location
+        if delivery_location and not existing_delivery_location:
+            record["delivery_location"] = delivery_location
+        if _clean_transfer_cell(record.get("pickup_datetime")).upper().startswith("TEL"):
+            record["pickup_datetime"] = None
+        if _clean_transfer_cell(record.get("delivery_datetime")).upper().startswith("TEL"):
+            record["delivery_datetime"] = None
+        if re.fullmatch(r"\d{2,5}-\d{1,4}-\d{3,4}", _clean_transfer_cell(record.get("pickup_datetime"))):
+            record["pickup_datetime"] = None
+        if re.fullmatch(r"\d{2,5}-\d{1,4}-\d{3,4}", _clean_transfer_cell(record.get("delivery_datetime"))):
+            record["delivery_datetime"] = None
+        if pickup_datetime and not record.get("pickup_datetime"):
+            record["pickup_datetime"] = pickup_datetime
+        if delivery_datetime and not record.get("delivery_datetime"):
+            record["delivery_datetime"] = delivery_datetime
+        draft = TransferRecordDraft(
+            vehicle_model=record.get("vehicle_model"),
+            vehicle_number=record.get("vehicle_number"),
+            pickup_datetime=record.get("pickup_datetime"),
+            pickup_location=record.get("pickup_location"),
+            delivery_datetime=record.get("delivery_datetime"),
+            delivery_location=record.get("delivery_location"),
+            confidence=_coerce_transfer_confidence(record.get("confidence")),
+            notes=record.get("notes"),
+        )
+        record["validation_json"] = _validate_transfer_record(draft)
+        record["needs_review"] = bool(record["validation_json"].get("needs_review"))
+        record["review_status"] = "NEEDS_REVIEW" if record["needs_review"] else record.get("review_status", "AUTO_REVIEWED")
+    return records
+
+
+def _coerce_transfer_confidence(value: Any) -> float:
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _looks_like_vehicle_value(value: Any) -> bool:
+    text = _clean_transfer_cell(value)
+    if not text:
+        return False
+    compact = re.sub(r"[^A-Za-z0-9]", "", text).upper()
+    return bool(
+        re.search(r"\b[A-Z]{2,}\d{2,}[A-Z0-9-]*\b", text)
+        or re.search(r"\b[A-Z]{2}\d{2}[A-Z]{2}-\d+\b", text)
+        or re.search(r"\b\d{6,}\b", text)
+        or re.search(r"[A-Z]{2,}\d{2,}.*\d{4,}", text)
+        or re.fullmatch(r"[A-Z]{2,}\d{2,}[A-Z0-9]*\d{4,}", compact)
+    )
+
+
+def _normalize_vehicle_number(value: Any) -> str | None:
+    text = _clean_transfer_cell(value)
+    if not text:
+        return None
+    text = re.sub(r"[\uff70\uff8c°º・･]", "-", text)
+    text = re.sub(r"\s+", "", text)
+    text = re.sub(r"-+", "-", text).strip("-")
+    return text or None
+
+
+def _normalize_transfer_datetime(value: Any) -> str | None:
+    text = _clean_transfer_cell(value)
+    if not text:
+        return None
+    text = text.lstrip("'")
+    text = re.sub(r"\s+", " ", text)
+    return text or None
+
+
+def _append_record_if_vehicle(records: list[TransferRecordDraft], record: TransferRecordDraft) -> None:
+    record.vehicle_number = _normalize_vehicle_number(record.vehicle_number)
+    record.pickup_datetime = _normalize_transfer_datetime(record.pickup_datetime)
+    record.delivery_datetime = _normalize_transfer_datetime(record.delivery_datetime)
+    if not (_looks_like_vehicle_value(record.vehicle_model) or _looks_like_vehicle_value(record.vehicle_number)):
+        return
+    record.validation_json = _validate_transfer_record(record)
+    records.append(record)
+
+
+def _extract_vehicle_records_from_standard_table(table: ExtractedTable) -> list[TransferRecordDraft]:
+    headers = [_clean_transfer_cell(header).lower() for header in table.headers]
+
+    def find_col(*keywords: str) -> int | None:
+        for index, header in enumerate(headers):
+            if any(keyword.lower() in header for keyword in keywords):
+                return index
+        return None
+
+    model_index = find_col("model", "車型", "車種", "型式", "車体番号")
+    number_index = find_col("vin", "車番", "車台", "登録", "管理番号")
+    if model_index is None and number_index is None:
+        return []
+
+    records: list[TransferRecordDraft] = []
+    for row in table.rows:
+        vehicle_model = _clean_transfer_cell(row[model_index]) if model_index is not None and model_index < len(row) else None
+        vehicle_number = _clean_transfer_cell(row[number_index]) if number_index is not None and number_index < len(row) else None
+        if vehicle_model and "(" in vehicle_model and ")" in vehicle_model and not vehicle_number:
+            vehicle_number = vehicle_model.split("(", 1)[0].strip()
+            vehicle_model = vehicle_model.split("(", 1)[1].rsplit(")", 1)[0].strip()
+        record = TransferRecordDraft(
+            vehicle_model=vehicle_model or None,
+            vehicle_number=vehicle_number or None,
+            confidence=0.65,
+            needs_review=True,
+            notes=f"table:{table.page}-{table.table_index}",
+        )
+        _append_record_if_vehicle(records, record)
+    return records
+
+
+def _extract_vehicle_records_from_request_grid(table: ExtractedTable) -> list[TransferRecordDraft]:
+    records: list[TransferRecordDraft] = []
+    rows = table.rows
+    table_text = " ".join(_clean_transfer_cell(cell) for row in [table.headers, *rows] for cell in row)
+    if not any(token in table_text for token in ("引取可能", "搬入希望", "搬⼊希望", "所在地", "搬入場所", "搬⼊場所")):
+        return records
+    for index, row in enumerate(rows):
+        row_text = " ".join(_clean_transfer_cell(cell) for cell in row)
+        if "車番" not in row_text and "車 番" not in row_text and "車台" not in row_text and "番" not in row_text:
+            continue
+
+        vehicle_number = None
+        for cell in row:
+            candidate = _clean_transfer_cell(cell)
+            if _looks_like_vehicle_value(candidate):
+                vehicle_number = candidate
+                break
+        if not vehicle_number:
+            continue
+
+        if index <= 3:
+            header_row = table.headers
+            time_row = rows[0] if len(rows) > 0 else []
+            location_row = rows[1] if len(rows) > 1 else []
+            model_row = table.headers
+        else:
+            header_row = rows[index - 3]
+            time_row = rows[index - 2]
+            location_row = rows[index - 1]
+            model_row = rows[index - 3]
+        pickup_datetime = _join_transfer_value_cells(
+            [*header_row[2:8], *time_row[2:7]],
+            {"引取可能", "期日", "車 型", "車型"},
+            skip_vehicle_like=True,
+        )
+        delivery_datetime = _join_transfer_value_cells(
+            [*header_row[7:13], *time_row[7:12]],
+            {"搬入希望", "搬⼊希望", "期日"},
+            skip_vehicle_like=True,
+        )
+        vehicle_model = None
+        for cell in [*model_row, *table.headers]:
+            candidate = _clean_transfer_cell(cell)
+            if re.search(r"\b[A-Z]{2,}\d{2,}[A-Z0-9-]*\b", candidate):
+                vehicle_model = candidate
+                break
+
+        pickup_location = _join_transfer_value_cells(location_row[2:7], {"所在地", "引取場所"})
+        delivery_location = _join_transfer_value_cells([*location_row[7:12], *location_row[15:18]], {"搬入場所", "搬⼊場所"})
+
+        record = TransferRecordDraft(
+            vehicle_model=vehicle_model,
+            vehicle_number=vehicle_number,
+            pickup_datetime=pickup_datetime,
+            pickup_location=pickup_location,
+            delivery_datetime=delivery_datetime,
+            delivery_location=delivery_location,
+            confidence=0.6,
+            needs_review=True,
+            notes=f"grid:{table.page}-{table.table_index}",
+        )
+        _append_record_if_vehicle(records, record)
+    return records
+
+
+def _build_transfer_records_from_llm(source_filename: str, extraction: ExtractionResult) -> tuple[list[dict[str, Any]], list[str]]:
+    result, error, attempted = extract_transfer_rows_with_ollama(
+        source_filename,
+        extraction.raw_text,
+        _tables_for_transfer_llm(extraction.tables),
+    )
+    if not result:
+        return [], [error] if attempted and error else []
+
+    records: list[TransferRecordDraft] = []
+    for row in result.get("rows") or []:
+        if not isinstance(row, dict):
+            continue
+        vehicle_model = row.get("vehicle_model")
+        vehicle_number = row.get("vehicle_number")
+        vehicle_label = row.get("vehicle_label")
+        if vehicle_label and (not vehicle_model or not vehicle_number):
+            label_parts = [part.strip() for part in str(vehicle_label).split("/") if part.strip()]
+            if len(label_parts) >= 2:
+                vehicle_model = vehicle_model or label_parts[0]
+                vehicle_number = vehicle_number or label_parts[-1]
+        record = TransferRecordDraft(
+            vehicle_model=vehicle_model,
+            vehicle_number=vehicle_number,
+            pickup_datetime=row.get("pickup_datetime"),
+            pickup_location=row.get("pickup_location"),
+            delivery_datetime=row.get("delivery_datetime"),
+            delivery_location=row.get("delivery_location"),
+            confidence=_coerce_transfer_confidence(row.get("confidence")),
+            notes=row.get("notes"),
+        )
+        record.validation_json = _validate_transfer_record(record)
+        records.append(record)
+    return _enrich_transfer_records_from_tables(_serialize_transfer_records(records), extraction), list(result.get("warnings") or [])
+
+
+def _build_transfer_records_from_tables(source_filename: str, extraction: ExtractionResult) -> list[dict[str, Any]]:
+    records: list[TransferRecordDraft] = []
+    for table in extraction.tables:
+        records.extend(_extract_vehicle_records_from_standard_table(table))
+        records.extend(_extract_vehicle_records_from_request_grid(table))
+    return _enrich_transfer_records_from_tables(_serialize_transfer_records(records[:50]), extraction)
+
+
+def _unique_path(destination_dir: Path, filename: str) -> Path:
+    candidate = destination_dir / filename
+    if not candidate.exists():
+        return candidate
+    stem = candidate.stem
+    suffix = candidate.suffix
+    for index in range(1, 1000):
+        next_candidate = destination_dir / f"{stem}_{index}{suffix}"
+        if not next_candidate.exists():
+            return next_candidate
+    return destination_dir / f"{stem}_{uuid.uuid4().hex[:8]}{suffix}"
+
+
+def _accept_inbox_file(voucher_type: str, source_path: Path, batch_id: str | None = None) -> str:
+    voucher_id = _new_id("v")
+    stored_path = settings.upload_dir / f"{voucher_id}{source_path.suffix.lower()}"
+    shutil.copy2(source_path, stored_path)
+    insert_voucher(
+        _build_voucher_payload(
+            voucher_id=voucher_id,
+            batch_id=batch_id,
+            voucher_type=voucher_type,
+            source_filename=source_path.name,
+            source_path=str(stored_path),
+            status="OCR_PROCESSING",
+        )
+    )
+    append_audit_log(_new_id("log"), voucher_id, "INBOX_ACCEPTED", {"filename": source_path.name, "voucher_type": voucher_type, "batch_id": batch_id})
+    processed_path = _unique_path(settings.processed_dir, source_path.name)
+    shutil.move(str(source_path), processed_path)
+    return voucher_id
 
 
 def _build_review_fields(voucher_type: str, form: Any) -> dict[str, ExtractedField]:
@@ -166,6 +776,7 @@ def _build_review_document_json(
 
 def _build_voucher_payload(
     voucher_id: str,
+    batch_id: str | None,
     voucher_type: str,
     source_filename: str,
     source_path: str,
@@ -174,6 +785,7 @@ def _build_voucher_payload(
     timestamp = now_iso()
     return {
         "id": voucher_id,
+        "batch_id": batch_id,
         "type": voucher_type,
         "status": status,
         "needs_review": 0,
@@ -200,7 +812,7 @@ def _build_voucher_payload(
     }
 
 
-def _accept_upload(voucher_type: str, upload: UploadFile) -> str:
+def _accept_upload(voucher_type: str, upload: UploadFile, batch_id: str | None = None) -> str:
     voucher_id = _new_id("v")
     suffix = Path(upload.filename or "upload.bin").suffix
     stored_path = settings.upload_dir / f"{voucher_id}{suffix}"
@@ -211,13 +823,14 @@ def _accept_upload(voucher_type: str, upload: UploadFile) -> str:
     insert_voucher(
         _build_voucher_payload(
             voucher_id=voucher_id,
+            batch_id=batch_id,
             voucher_type=voucher_type,
             source_filename=upload.filename or stored_path.name,
             source_path=str(stored_path),
             status="OCR_PROCESSING",
         )
     )
-    append_audit_log(_new_id("log"), voucher_id, "UPLOAD_ACCEPTED", {"filename": upload.filename, "voucher_type": voucher_type})
+    append_audit_log(_new_id("log"), voucher_id, "UPLOAD_ACCEPTED", {"filename": upload.filename, "voucher_type": voucher_type, "batch_id": batch_id})
     return voucher_id
 
 
@@ -262,6 +875,15 @@ def process_voucher_ocr(voucher_id: str) -> None:
         _log_ocr(f"fields done voucher_id={voucher_id} items={len(extraction.items)}")
         validation = validate_extraction(extraction)
         _log_ocr(f"validation done voucher_id={voucher_id} status={validation['status']}")
+        transfer_records, transfer_warnings = _build_transfer_records_from_llm(voucher["source_filename"], extraction)
+        if not transfer_records:
+            transfer_records = _build_transfer_records_from_tables(voucher["source_filename"], extraction)
+        if transfer_records:
+            replace_transfer_records(voucher_id, transfer_records)
+            validation["warnings"] = [*validation.get("warnings", []), *transfer_warnings]
+            validation["transfer_record_count"] = len(transfer_records)
+            validation["transfer_review_count"] = sum(1 for record in transfer_records if record.get("needs_review"))
+            _log_ocr(f"transfer records done voucher_id={voucher_id} records={len(transfer_records)}")
         field_values = {key: field.value for key, field in extraction.fields.items()}
         max_confidence = max((field.confidence for field in extraction.fields.values()), default=0.0)
         items = [
@@ -372,6 +994,8 @@ def on_shutdown() -> None:
 @app.get("/")
 def index(request: Request):
     vouchers = fetch_all_vouchers()
+    current_batch_id = request.query_params.get("batch_id") or ""
+    current_batch_vouchers = [voucher for voucher in vouchers if voucher.get("batch_id") == current_batch_id] if current_batch_id else []
     return templates.TemplateResponse(
         request,
         "index.html",
@@ -381,6 +1005,8 @@ def index(request: Request):
             "vouchers": vouchers,
             "voucher_type_labels": VOUCHER_TYPE_LABELS,
             "status_labels": STATUS_LABELS,
+            "current_batch_id": current_batch_id,
+            "current_batch_count": len(current_batch_vouchers),
         },
     )
 
@@ -391,10 +1017,11 @@ async def upload_voucher(
     files: list[UploadFile] = File(...),
 ):
     created_ids: list[str] = []
+    batch_id = _new_id("batch")
     for upload in files:
         if not (upload.filename or "").strip():
             continue
-        voucher_id = _accept_upload(voucher_type, upload)
+        voucher_id = _accept_upload(voucher_type, upload, batch_id=batch_id)
         created_ids.append(voucher_id)
         enqueue_voucher_ocr(voucher_id)
 
@@ -402,7 +1029,42 @@ async def upload_voucher(
         raise HTTPException(status_code=400, detail="No files uploaded")
     if len(created_ids) == 1:
         return RedirectResponse(url=f"/vouchers/{created_ids[0]}", status_code=303)
-    return RedirectResponse(url="/", status_code=303)
+    return RedirectResponse(url=f"/?batch_id={batch_id}", status_code=303)
+
+
+@app.post("/import/inbox")
+def import_inbox(voucher_type: str = Form("delivery")):
+    created_ids: list[str] = []
+    batch_id = _new_id("batch")
+    for source_path in sorted(settings.inbox_dir.iterdir()):
+        if not source_path.is_file() or source_path.suffix.lower() not in SUPPORTED_INPUT_SUFFIXES:
+            continue
+        voucher_id = _accept_inbox_file(voucher_type, source_path, batch_id=batch_id)
+        created_ids.append(voucher_id)
+        enqueue_voucher_ocr(voucher_id)
+
+    if created_ids:
+        return RedirectResponse(url=f"/vouchers/{created_ids[0]}" if len(created_ids) == 1 else f"/?batch_id={batch_id}", status_code=303)
+    raise HTTPException(status_code=400, detail="No supported files found in inbox")
+
+
+@app.get("/demo/empty-review")
+def empty_review_demo(request: Request):
+    return templates.TemplateResponse(
+        request,
+        "voucher_detail.html",
+        {
+            "request": request,
+            "settings": settings,
+            "voucher": _empty_review_demo_voucher(),
+            "voucher_type_labels": VOUCHER_TYPE_LABELS,
+            "status_labels": STATUS_LABELS,
+            "field_labels": FIELD_LABELS,
+            "source_preview_kind": None,
+            "source_preview_url": "",
+            "demo_empty_result": True,
+        },
+    )
 
 
 @app.get("/vouchers/{voucher_id}")
@@ -423,6 +1085,7 @@ def voucher_detail(request: Request, voucher_id: str):
             "field_labels": FIELD_LABELS,
             "source_preview_kind": source_preview_kind,
             "source_preview_url": f"/vouchers/{voucher_id}/source",
+            "demo_empty_result": False,
         },
     )
 
@@ -456,6 +1119,14 @@ async def review_voucher(request: Request, voucher_id: str):
     unit_prices = form.getlist("item_unit_price")
     amounts = form.getlist("item_amount")
     tax_rates = form.getlist("item_tax_rate")
+    transfer_ids = form.getlist("transfer_id")
+    transfer_vehicle_models = form.getlist("transfer_vehicle_model")
+    transfer_vehicle_numbers = form.getlist("transfer_vehicle_number")
+    transfer_pickup_datetimes = form.getlist("transfer_pickup_datetime")
+    transfer_pickup_locations = form.getlist("transfer_pickup_location")
+    transfer_delivery_datetimes = form.getlist("transfer_delivery_datetime")
+    transfer_delivery_locations = form.getlist("transfer_delivery_location")
+    transfer_notes = form.getlist("transfer_notes")
 
     reviewed_items: list[VoucherItemDraft] = []
     for index, description in enumerate(descriptions):
@@ -540,6 +1211,41 @@ async def review_voucher(request: Request, voucher_id: str):
     }
 
     update_voucher(voucher_id, payload, _serialize_items_for_db(voucher_id, serialized_items))
+    reviewed_transfer_records: list[dict[str, Any]] = []
+    for index, vehicle_model in enumerate(transfer_vehicle_models):
+        vehicle_number = transfer_vehicle_numbers[index] if index < len(transfer_vehicle_numbers) else ""
+        pickup_location = transfer_pickup_locations[index] if index < len(transfer_pickup_locations) else ""
+        delivery_location = transfer_delivery_locations[index] if index < len(transfer_delivery_locations) else ""
+        if not any([vehicle_model, vehicle_number, pickup_location, delivery_location]):
+            continue
+        record = TransferRecordDraft(
+            vehicle_model=vehicle_model or None,
+            vehicle_number=vehicle_number or None,
+            pickup_datetime=transfer_pickup_datetimes[index] if index < len(transfer_pickup_datetimes) and transfer_pickup_datetimes[index] else None,
+            pickup_location=pickup_location or None,
+            delivery_datetime=transfer_delivery_datetimes[index] if index < len(transfer_delivery_datetimes) and transfer_delivery_datetimes[index] else None,
+            delivery_location=delivery_location or None,
+            confidence=1.0,
+            notes=transfer_notes[index] if index < len(transfer_notes) and transfer_notes[index] else None,
+        )
+        validation_json = _validate_transfer_record(record)
+        reviewed_transfer_records.append(
+            {
+                "id": transfer_ids[index] if index < len(transfer_ids) and transfer_ids[index] else _new_id("tr"),
+                "vehicle_model": record.vehicle_model,
+                "vehicle_number": record.vehicle_number,
+                "pickup_datetime": record.pickup_datetime,
+                "pickup_location": record.pickup_location,
+                "delivery_datetime": record.delivery_datetime,
+                "delivery_location": record.delivery_location,
+                "confidence": record.confidence,
+                "needs_review": validation_json["needs_review"],
+                "notes": record.notes,
+                "validation_json": validation_json,
+            }
+        )
+    if reviewed_transfer_records or voucher.get("transfer_records"):
+        update_transfer_records(voucher_id, reviewed_transfer_records, reviewer="local")
     append_audit_log(_new_id("log"), voucher_id, "REVIEW_SAVED", {"status": payload["status"]})
     return RedirectResponse(url=f"/vouchers/{voucher_id}", status_code=303)
 
@@ -583,6 +1289,17 @@ def export_csv(voucher_id: str):
     export_path = export_voucher_csv_zip(voucher)
     update_status(voucher_id, "EXPORTED", exported_at=now_iso())
     append_audit_log(_new_id("log"), voucher_id, "EXPORTED_CSV", {"path": str(export_path)})
+    return FileResponse(export_path, filename=export_path.name)
+
+
+@app.get("/export/transfer-summary.xlsx")
+def export_transfer_summary(operator_name: str | None = None, batch_id: str | None = None):
+    voucher_rows = fetch_all_vouchers()
+    if batch_id:
+        voucher_rows = [voucher for voucher in voucher_rows if voucher.get("batch_id") == batch_id]
+    vouchers = [fetch_voucher(voucher["id"]) for voucher in voucher_rows]
+    export_path = export_transfer_summary_xlsx([voucher for voucher in vouchers if voucher is not None], operator_name)
+    append_audit_log(_new_id("log"), None, "EXPORTED_TRANSFER_SUMMARY_XLSX", {"path": str(export_path), "batch_id": batch_id})
     return FileResponse(export_path, filename=export_path.name)
 
 
