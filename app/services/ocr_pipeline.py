@@ -79,6 +79,7 @@ def _build_ocr_engine(*, prefer_gpu: bool) -> Any:
 
     use_gpu = prefer_gpu and settings.paddleocr_use_gpu
     device = "gpu" if use_gpu else "cpu"
+    safe_side_limit = min(settings.paddleocr_max_side_limit, 4000)
     _log_ocr(f"initialize PaddleOCR device={device}")
 
     try:
@@ -88,7 +89,7 @@ def _build_ocr_engine(*, prefer_gpu: bool) -> Any:
             "use_doc_orientation_classify": False,
             "use_doc_unwarping": False,
             "use_textline_orientation": False,
-            "text_det_limit_side_len": settings.paddleocr_max_side_limit,
+            "text_det_limit_side_len": safe_side_limit,
             "text_det_limit_type": "max",
         }
         det_model_dir = _existing_model_path("PP-OCRv5_server_det")
@@ -110,7 +111,7 @@ def _build_ocr_engine(*, prefer_gpu: bool) -> Any:
             "enable_mkldnn": False,
             "ir_optim": False,
             "cpu_threads": 2,
-            "det_limit_side_len": settings.paddleocr_max_side_limit,
+            "det_limit_side_len": safe_side_limit,
             "det_limit_type": "max",
         }
         det_model_dir = _existing_model_path("det")
@@ -1395,8 +1396,16 @@ def extract_tables(file_path: Path, ocr_lines: list[OCRLine] | None = None) -> l
 def preprocess_image(image: Image.Image) -> Image.Image:
     grayscale = ImageOps.grayscale(image)
     enhanced = ImageOps.autocontrast(grayscale)
+    safe_side_limit = min(settings.paddleocr_max_side_limit, 4000)
+    largest_side = max(enhanced.size)
+    if largest_side > safe_side_limit:
+        scale = safe_side_limit / largest_side
+        enhanced = enhanced.resize(
+            (max(1, int(enhanced.width * scale)), max(1, int(enhanced.height * scale))),
+            Image.Resampling.LANCZOS,
+        )
     if max(enhanced.size) < 4200:
-        scale = min(1.5, settings.paddleocr_max_side_limit / max(enhanced.size))
+        scale = min(1.5, safe_side_limit / max(enhanced.size))
         if scale > 1.0:
             enhanced = enhanced.resize(
                 (max(1, int(enhanced.width * scale)), max(1, int(enhanced.height * scale))),

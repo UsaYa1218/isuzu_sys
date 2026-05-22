@@ -3,6 +3,7 @@ from __future__ import annotations
 import multiprocessing
 import os
 import socket
+import sys
 import threading
 import webbrowser
 
@@ -34,12 +35,18 @@ def main() -> None:
     os.environ.setdefault("APP_ENV", "desktop")
     os.environ.setdefault("REQUEUE_PROCESSING_OCR_ON_STARTUP", "true")
 
-    port = _find_available_port(int(os.getenv("APP_PORT", str(DEFAULT_PORT))))
+    no_browser = "--no-browser" in sys.argv
+    port_arg = next((arg for arg in sys.argv[1:] if arg.startswith("--port=")), "")
+    requested_port = int(port_arg.split("=", 1)[1]) if port_arg else int(os.getenv("APP_PORT", str(DEFAULT_PORT)))
+    port = _find_available_port(requested_port)
     url = f"http://{DEFAULT_HOST}:{port}"
-    threading.Timer(1.2, _open_browser, args=(url,)).start()
+    if not no_browser:
+        threading.Timer(1.2, _open_browser, args=(url,)).start()
     print(f"Transfer Summary Tool is running: {url}")
     print("Close this window to stop the application.")
-    uvicorn.run("app.main:app", host=DEFAULT_HOST, port=port, reload=False, log_level="info")
+    from app.main import app
+
+    uvicorn.run(app, host=DEFAULT_HOST, port=port, reload=False, log_level="info")
 
 
 if __name__ == "__main__":

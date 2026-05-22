@@ -114,7 +114,7 @@ class Settings:
             static_dir=RESOURCE_BASE_DIR / "app" / "static",
             ocr_dpi=int(os.getenv("OCR_DPI", "300")),
             ocr_confidence_threshold=float(os.getenv("OCR_CONFIDENCE_THRESHOLD", "0.75")),
-            paddleocr_max_side_limit=int(os.getenv("PADDLEOCR_MAX_SIDE_LIMIT", "5600")),
+            paddleocr_max_side_limit=int(os.getenv("PADDLEOCR_MAX_SIDE_LIMIT", "4000")),
             paddleocr_lang=os.getenv("PADDLEOCR_LANG", "japan"),
             paddleocr_use_gpu=_to_bool(os.getenv("PADDLEOCR_USE_GPU"), True),
             paddleocr_model_dir=data_dir / "paddleocr",

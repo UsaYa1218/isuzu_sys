@@ -7,6 +7,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 from tkinter import BOTH, END, LEFT, RIGHT, VERTICAL, W, X, Y, filedialog, messagebox, ttk
 import tkinter as tk
@@ -453,8 +454,67 @@ class TransferSummaryDesktop:
 
 
 def main() -> None:
+    if len(sys.argv) >= 3 and sys.argv[1] == "--smoke-ocr":
+        raise SystemExit(run_smoke_ocr(Path(sys.argv[2])))
     app = TransferSummaryDesktop()
     app.run()
+
+
+def run_smoke_ocr(source_path: Path) -> int:
+    settings.ensure_directories()
+    log_path = settings.data_dir / "smoke_ocr.log"
+    lines: list[str] = []
+
+    def log(message: str) -> None:
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        lines.append(f"{timestamp} {message}")
+        log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def progress(message: str, percent: float | None) -> None:
+        if percent is None:
+            log(message)
+        else:
+            log(f"{message} [{percent:.1f}%]")
+
+    try:
+        source_path = source_path.resolve()
+        log(f"smoke start: {source_path}")
+        if not source_path.is_file():
+            raise FileNotFoundError(source_path)
+
+        ocr_lines = run_ocr(source_path, progress_callback=progress)
+        log(f"ocr lines: {len(ocr_lines)}")
+        tables = extract_tables(source_path, ocr_lines)
+        log(f"tables: {len(tables)}")
+        extraction = ExtractionResult(
+            voucher_type="delivery",
+            raw_text="\n".join(line.text for line in ocr_lines),
+            tables=tables,
+        )
+        records, warnings = _build_transfer_records_from_llm(source_path.name, extraction)
+        if not records:
+            records = _build_transfer_records_from_tables(source_path.name, extraction)
+        log(f"records: {len(records)}")
+        for warning in warnings:
+            log(f"warning: {warning}")
+
+        export_path = export_transfer_summary_xlsx(
+            [
+                {
+                    "id": source_path.stem,
+                    "source_filename": source_path.name,
+                    "status": "SMOKE",
+                    "transfer_records": records,
+                }
+            ]
+        )
+        log(f"export: {export_path}")
+        log("smoke ok")
+        return 0
+    except Exception:  # noqa: BLE001
+        log("smoke failed")
+        log(traceback.format_exc())
+        return 1
 
 
 if __name__ == "__main__":

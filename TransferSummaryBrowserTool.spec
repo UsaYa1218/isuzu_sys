@@ -22,26 +22,6 @@ def collect_python_extension_modules(module_names):
     return collected
 
 
-def collect_tk_dlls():
-    candidates = []
-    base_prefix = Path(sys.base_prefix)
-    prefix = Path(sys.prefix)
-    for root in (prefix, base_prefix):
-        candidates.extend([
-            root / "Library" / "bin" / "tcl86t.dll",
-            root / "Library" / "bin" / "tk86t.dll",
-            root / "DLLs" / "tcl86t.dll",
-            root / "DLLs" / "tk86t.dll",
-        ])
-    collected = []
-    seen = set()
-    for path in candidates:
-        if path.exists() and path.name.lower() not in seen:
-            collected.append((str(path), "."))
-            seen.add(path.name.lower())
-    return collected
-
-
 def collect_conda_library_dlls():
     names = [
         "libssl-3-x64.dll",
@@ -66,6 +46,26 @@ def collect_conda_library_dlls():
             if path.exists() and key not in seen:
                 collected.append((str(path), "."))
                 seen.add(key)
+    return collected
+
+
+def collect_tk_dlls():
+    candidates = []
+    base_prefix = Path(sys.base_prefix)
+    prefix = Path(sys.prefix)
+    for root in (prefix, base_prefix):
+        candidates.extend([
+            root / "Library" / "bin" / "tcl86t.dll",
+            root / "Library" / "bin" / "tk86t.dll",
+            root / "DLLs" / "tcl86t.dll",
+            root / "DLLs" / "tk86t.dll",
+        ])
+    collected = []
+    seen = set()
+    for path in candidates:
+        if path.exists() and path.name.lower() not in seen:
+            collected.append((str(path), "."))
+            seen.add(path.name.lower())
     return collected
 
 
@@ -111,61 +111,55 @@ def collect_package_metadata(package_names):
     return collected
 
 
-datas = [('app\\templates', 'app\\templates'), ('app\\static', 'app\\static')]
+datas = [("app\\templates", "app\\templates"), ("app\\static", "app\\static")]
 datas += collect_tcl_tk_data()
 datas += collect_cython_utility_data()
 datas += collect_package_metadata([
-    'einops',
-    'ftfy',
-    'imagesize',
-    'Jinja2',
-    'lxml',
-    'opencv-contrib-python',
-    'opencv-python',
-    'opencv-python-headless',
-    'openpyxl',
-    'premailer',
-    'pyclipper',
-    'pypdfium2',
-    'regex',
-    'scikit-learn',
-    'shapely',
-    'tiktoken',
-    'tokenizers',
+    "einops",
+    "ftfy",
+    "imagesize",
+    "Jinja2",
+    "lxml",
+    "opencv-contrib-python",
+    "opencv-python",
+    "opencv-python-headless",
+    "openpyxl",
+    "premailer",
+    "pyclipper",
+    "pypdfium2",
+    "regex",
+    "scikit-learn",
+    "shapely",
+    "tiktoken",
+    "tokenizers",
 ])
 binaries = []
 hiddenimports = [
-    'paddleocr',
-    'paddlex',
-    'cv2',
-    '_socket',
-    '_ssl',
-    '_hashlib',
-    '_bz2',
-    '_lzma',
-    '_ctypes',
-    '_decimal',
-    '_queue',
-    'select',
+    "paddleocr",
+    "paddlex",
+    "cv2",
+    "_socket",
+    "_ssl",
+    "_hashlib",
+    "_bz2",
+    "_lzma",
+    "_ctypes",
+    "_decimal",
+    "_queue",
+    "select",
 ]
 binaries += collect_python_extension_modules(hiddenimports)
-binaries += collect_tk_dlls()
 binaries += collect_conda_library_dlls()
-tmp_ret = collect_all('tkinterdnd2')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('paddleocr')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('paddlex')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('paddle')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-for package_name in ['imagesize', 'pyclipper', 'pypdfium2', 'shapely']:
+binaries += collect_tk_dlls()
+for package_name in ["paddleocr", "paddlex", "paddle", "imagesize", "pyclipper", "pypdfium2", "shapely"]:
     tmp_ret = collect_all(package_name)
-    datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+    datas += tmp_ret[0]
+    binaries += tmp_ret[1]
+    hiddenimports += tmp_ret[2]
 
 
 a = Analysis(
-    ['desktop_app.py'],
+    ["desktop_launcher.py"],
     pathex=[],
     binaries=binaries,
     datas=datas,
@@ -184,12 +178,12 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='TransferSummaryTool',
+    name="TransferSummaryBrowserTool",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    console=False,
+    console=True,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
@@ -203,5 +197,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='TransferSummaryTool',
+    name="TransferSummaryBrowserTool",
 )
