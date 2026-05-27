@@ -7,7 +7,8 @@ Transfer Summary Tool
 1. TransferSummaryTool.exe を実行します。
 2. アプリ画面にPDFや画像をドラッグ&ドロップします。
 3. 「これらのファイルを処理」を押します。
-4. OCR処理後、runtime\exports にExcelが作成されます。
+4. Validation が低い場合は、確認・修正画面に表示される元PDF/画像と照合し、必要な項目を修正します。
+5. 確認完了後、runtime\exports にExcelが作成されます。
 
 初回起動
 --------

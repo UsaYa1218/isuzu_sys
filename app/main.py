@@ -205,7 +205,72 @@ def _validate_transfer_record(record: TransferRecordDraft) -> dict[str, Any]:
         warnings.append("搬入場所を確認してください。")
     if record.confidence < settings.ocr_confidence_threshold:
         warnings.append("陸送情報の信頼度が低いため確認してください。")
-    return {"warnings": warnings, "needs_review": bool(warnings)}
+    return {
+        "warnings": warnings,
+        "needs_review": bool(warnings),
+        "confidence": round(record.confidence, 3),
+        "confidence_threshold": settings.ocr_confidence_threshold,
+        "low_confidence": record.confidence < settings.ocr_confidence_threshold,
+    }
+
+
+def _finalize_validation(
+    validation: dict[str, Any],
+    transfer_records: list[dict[str, Any]] | None = None,
+    *,
+    manual_confirmation_completed: bool = False,
+) -> dict[str, Any]:
+    records = transfer_records or []
+    transfer_review_count = sum(1 for record in records if record.get("needs_review"))
+    transfer_scores = [
+        _coerce_transfer_confidence(record.get("confidence"))
+        for record in records
+        if record.get("confidence") is not None
+    ]
+    transfer_confidence_score = round(min(transfer_scores), 3) if transfer_scores else None
+    confidence_scores = [
+        score
+        for score in (validation.get("confidence_score"), transfer_confidence_score)
+        if score is not None
+    ]
+    confidence_score = round(min(confidence_scores), 3) if confidence_scores else None
+    threshold = settings.ocr_confidence_threshold
+    low_confidence = confidence_score is not None and confidence_score < threshold
+    issues_detected = bool(validation.get("issues_detected", validation.get("needs_review"))) or transfer_review_count > 0
+    required = issues_detected or low_confidence
+    completed = bool(manual_confirmation_completed) if required else True
+
+    validation.update(
+        {
+            "status": "REVIEW_REQUIRED" if required and not completed else "READY_FOR_APPROVAL",
+            "needs_review": required and not completed,
+            "issues_detected": issues_detected,
+            "confidence_score": confidence_score,
+            "confidence_threshold": threshold,
+            "low_confidence": low_confidence,
+            "manual_confirmation_required": required,
+            "manual_confirmation_completed": completed,
+            "transfer_record_count": len(records),
+            "transfer_review_count": transfer_review_count,
+            "transfer_confidence_score": transfer_confidence_score,
+        }
+    )
+    return validation
+
+
+def _requires_uncompleted_confirmation(voucher: dict[str, Any]) -> bool:
+    validation = voucher.get("validation_json") or {}
+    required = bool(validation.get("manual_confirmation_required", voucher.get("needs_review")))
+    completed = bool(validation.get("manual_confirmation_completed", not required))
+    return required and not completed
+
+
+def _require_completed_confirmation(voucher: dict[str, Any], operation: str) -> None:
+    if _requires_uncompleted_confirmation(voucher):
+        raise HTTPException(
+            status_code=409,
+            detail=f"validation の確認が必要です。確認内容を保存してから{operation}してください。",
+        )
 
 
 def _serialize_transfer_records(records: list[TransferRecordDraft]) -> list[dict[str, Any]]:
@@ -874,16 +939,20 @@ def process_voucher_ocr(voucher_id: str) -> None:
         extraction = extract_document(voucher["type"], lines, tables=tables)
         _log_ocr(f"fields done voucher_id={voucher_id} items={len(extraction.items)}")
         validation = validate_extraction(extraction)
-        _log_ocr(f"validation done voucher_id={voucher_id} status={validation['status']}")
         transfer_records, transfer_warnings = _build_transfer_records_from_llm(voucher["source_filename"], extraction)
         if not transfer_records:
             transfer_records = _build_transfer_records_from_tables(voucher["source_filename"], extraction)
+        validation["warnings"] = [*validation.get("warnings", []), *transfer_warnings]
+        if transfer_warnings:
+            validation["issues_detected"] = True
         if transfer_records:
             replace_transfer_records(voucher_id, transfer_records)
-            validation["warnings"] = [*validation.get("warnings", []), *transfer_warnings]
-            validation["transfer_record_count"] = len(transfer_records)
-            validation["transfer_review_count"] = sum(1 for record in transfer_records if record.get("needs_review"))
             _log_ocr(f"transfer records done voucher_id={voucher_id} records={len(transfer_records)}")
+        elif voucher["type"] == "delivery":
+            validation["warnings"] = [*validation.get("warnings", []), "陸送情報が抽出されませんでした。元伝票を確認してください。"]
+            validation["issues_detected"] = True
+        validation = _finalize_validation(validation, transfer_records)
+        _log_ocr(f"validation done voucher_id={voucher_id} status={validation['status']} score={validation['confidence_score']}")
         field_values = {key: field.value for key, field in extraction.fields.items()}
         max_confidence = max((field.confidence for field in extraction.fields.values()), default=0.0)
         items = [
@@ -1168,7 +1237,6 @@ async def review_voucher(request: Request, voucher_id: str):
         tables=[],
         llm_used=bool(document_json.get("llm_used")),
     )
-    validation = validate_extraction(extraction)
     serialized_items = [
         {
             "id": item_ids[index] if index < len(item_ids) and item_ids[index] else None,
@@ -1184,33 +1252,6 @@ async def review_voucher(request: Request, voucher_id: str):
         for index, item in enumerate(reviewed_items)
     ]
 
-    payload = {
-        "type": voucher_type,
-        "status": validation["status"],
-        "needs_review": int(validation["needs_review"]),
-        "issue_date": fields["issue_date"].value,
-        "due_date": fields["due_date"].value,
-        "document_number": fields["document_number"].value,
-        "vendor_name": fields["vendor_name"].value,
-        "customer_name": fields["customer_name"].value,
-        "currency": fields["currency"].value or "JPY",
-        "subtotal": fields["subtotal"].value,
-        "tax": fields["tax"].value,
-        "discount": fields["discount"].value,
-        "grand_total": fields["grand_total"].value,
-        "confidence": float(form.get("confidence") or voucher.get("confidence") or 0.0),
-        "notes": fields["notes"].value,
-        "document_json": json.dumps(
-            _build_review_document_json(voucher, voucher_type, fields, reviewed_items, validation),
-            ensure_ascii=False,
-        ),
-        "raw_ocr_json": json.dumps(voucher.get("raw_ocr_json", {}), ensure_ascii=False),
-        "validation_json": json.dumps(validation, ensure_ascii=False),
-        "exported_at": voucher.get("exported_at"),
-        "updated_at": now_iso(),
-    }
-
-    update_voucher(voucher_id, payload, _serialize_items_for_db(voucher_id, serialized_items))
     reviewed_transfer_records: list[dict[str, Any]] = []
     for index, vehicle_model in enumerate(transfer_vehicle_models):
         vehicle_number = transfer_vehicle_numbers[index] if index < len(transfer_vehicle_numbers) else ""
@@ -1244,9 +1285,69 @@ async def review_voucher(request: Request, voucher_id: str):
                 "validation_json": validation_json,
             }
         )
+    confirmation_checked = str(form.get("manual_confirmation_completed") or "").lower() in {"1", "true", "yes", "on"}
+    validation = validate_extraction(extraction)
+    if voucher_type == "delivery" and not reviewed_transfer_records:
+        validation["issues_detected"] = True
+        validation["warnings"] = [*validation.get("warnings", []), "陸送情報が入力されていません。元伝票を確認してください。"]
+    if _requires_uncompleted_confirmation(voucher) and not confirmation_checked:
+        validation["issues_detected"] = True
+        validation["warnings"] = [
+            *validation.get("warnings", []),
+            "前回の validation 判定について、元伝票との照合確認を完了してください。",
+        ]
+    validation = _finalize_validation(
+        validation,
+        reviewed_transfer_records,
+        manual_confirmation_completed=confirmation_checked,
+    )
+    if validation["manual_confirmation_completed"]:
+        for record in reviewed_transfer_records:
+            if record.get("needs_review"):
+                record["needs_review"] = False
+                record["validation_json"] = {
+                    **(record.get("validation_json") or {}),
+                    "manual_confirmation_completed": True,
+                }
+    payload = {
+        "type": voucher_type,
+        "status": validation["status"],
+        "needs_review": int(validation["needs_review"]),
+        "issue_date": fields["issue_date"].value,
+        "due_date": fields["due_date"].value,
+        "document_number": fields["document_number"].value,
+        "vendor_name": fields["vendor_name"].value,
+        "customer_name": fields["customer_name"].value,
+        "currency": fields["currency"].value or "JPY",
+        "subtotal": fields["subtotal"].value,
+        "tax": fields["tax"].value,
+        "discount": fields["discount"].value,
+        "grand_total": fields["grand_total"].value,
+        "confidence": float(form.get("confidence") or voucher.get("confidence") or 0.0),
+        "notes": fields["notes"].value,
+        "document_json": json.dumps(
+            _build_review_document_json(voucher, voucher_type, fields, reviewed_items, validation),
+            ensure_ascii=False,
+        ),
+        "raw_ocr_json": json.dumps(voucher.get("raw_ocr_json", {}), ensure_ascii=False),
+        "validation_json": json.dumps(validation, ensure_ascii=False),
+        "exported_at": voucher.get("exported_at"),
+        "updated_at": now_iso(),
+    }
+
+    update_voucher(voucher_id, payload, _serialize_items_for_db(voucher_id, serialized_items))
     if reviewed_transfer_records or voucher.get("transfer_records"):
         update_transfer_records(voucher_id, reviewed_transfer_records, reviewer="local")
-    append_audit_log(_new_id("log"), voucher_id, "REVIEW_SAVED", {"status": payload["status"]})
+    append_audit_log(
+        _new_id("log"),
+        voucher_id,
+        "REVIEW_SAVED",
+        {
+            "status": payload["status"],
+            "validation_score": validation.get("confidence_score"),
+            "manual_confirmation_completed": validation.get("manual_confirmation_completed"),
+        },
+    )
     return RedirectResponse(url=f"/vouchers/{voucher_id}", status_code=303)
 
 
@@ -1264,6 +1365,8 @@ async def transition_voucher(voucher_id: str, action: str = Form(...)):
     }
     if action not in mapping:
         raise HTTPException(status_code=400, detail="Unknown transition")
+    if action in {"submit", "approve"}:
+        _require_completed_confirmation(voucher, "状態変更")
 
     update_status(voucher_id, mapping[action])
     append_audit_log(_new_id("log"), voucher_id, "STATUS_CHANGED", {"action": action, "status": mapping[action]})
@@ -1275,6 +1378,7 @@ def export_xlsx(voucher_id: str):
     voucher = fetch_voucher(voucher_id)
     if voucher is None:
         raise HTTPException(status_code=404, detail="Voucher not found")
+    _require_completed_confirmation(voucher, "Excel 出力")
     export_path = export_voucher_xlsx(voucher)
     update_status(voucher_id, "EXPORTED", exported_at=now_iso())
     append_audit_log(_new_id("log"), voucher_id, "EXPORTED_XLSX", {"path": str(export_path)})
@@ -1286,6 +1390,7 @@ def export_csv(voucher_id: str):
     voucher = fetch_voucher(voucher_id)
     if voucher is None:
         raise HTTPException(status_code=404, detail="Voucher not found")
+    _require_completed_confirmation(voucher, "CSV 出力")
     export_path = export_voucher_csv_zip(voucher)
     update_status(voucher_id, "EXPORTED", exported_at=now_iso())
     append_audit_log(_new_id("log"), voucher_id, "EXPORTED_CSV", {"path": str(export_path)})
@@ -1298,6 +1403,16 @@ def export_transfer_summary(operator_name: str | None = None, batch_id: str | No
     if batch_id:
         voucher_rows = [voucher for voucher in voucher_rows if voucher.get("batch_id") == batch_id]
     vouchers = [fetch_voucher(voucher["id"]) for voucher in voucher_rows]
+    blocked_vouchers = [
+        voucher
+        for voucher in vouchers
+        if voucher is not None and voucher.get("transfer_records") and _requires_uncompleted_confirmation(voucher)
+    ]
+    if blocked_vouchers:
+        raise HTTPException(
+            status_code=409,
+            detail="validation の確認が完了していない伝票が含まれています。各伝票を確認してから Excel 出力してください。",
+        )
     export_path = export_transfer_summary_xlsx([voucher for voucher in vouchers if voucher is not None], operator_name)
     append_audit_log(_new_id("log"), None, "EXPORTED_TRANSFER_SUMMARY_XLSX", {"path": str(export_path), "batch_id": batch_id})
     return FileResponse(export_path, filename=export_path.name)

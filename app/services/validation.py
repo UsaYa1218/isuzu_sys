@@ -43,10 +43,29 @@ def validate_extraction(result: ExtractionResult) -> dict[str, Any]:
         item.needs_review or item.confidence < settings.ocr_confidence_threshold for item in result.items
     )
     needs_review = needs_review or bool(warnings)
-    status = "REVIEW_REQUIRED" if needs_review else "READY_FOR_APPROVAL"
+    assessed_confidences = [
+        field.confidence
+        for field in result.fields.values()
+        if field.value not in (None, "")
+    ]
+    assessed_confidences.extend(
+        item.confidence
+        for item in result.items
+        if any((item.description, item.quantity, item.unit, item.unit_price, item.amount, item.tax_rate))
+    )
+    confidence_score = round(min(assessed_confidences), 3) if assessed_confidences else None
+    low_confidence = confidence_score is not None and confidence_score < settings.ocr_confidence_threshold
+    manual_confirmation_required = needs_review or low_confidence
+    status = "REVIEW_REQUIRED" if manual_confirmation_required else "READY_FOR_APPROVAL"
 
     return {
         "status": status,
-        "needs_review": needs_review,
+        "needs_review": manual_confirmation_required,
         "warnings": warnings,
+        "issues_detected": needs_review,
+        "confidence_score": confidence_score,
+        "confidence_threshold": settings.ocr_confidence_threshold,
+        "low_confidence": low_confidence,
+        "manual_confirmation_required": manual_confirmation_required,
+        "manual_confirmation_completed": not manual_confirmation_required,
     }

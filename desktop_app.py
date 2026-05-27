@@ -9,8 +9,11 @@ import threading
 import time
 import traceback
 from pathlib import Path
+from typing import Any
 from tkinter import BOTH, END, LEFT, RIGHT, VERTICAL, W, X, Y, filedialog, messagebox, ttk
 import tkinter as tk
+
+from PIL import Image, ImageTk
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -37,12 +40,15 @@ class TransferSummaryDesktop:
         self.root.minsize(780, 520)
 
         self.files: list[Path] = []
-        self.messages: queue.Queue[tuple[str, str]] = queue.Queue()
+        self.messages: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.processing = False
         self.last_export_path: Path | None = None
         self.started_at: float | None = None
         self.current_file_index = 0
         self.total_files = 0
+        self.validation_confirmation_event: threading.Event | None = None
+        self.validation_confirmed = False
+        self.validation_dialog: tk.Toplevel | None = None
 
         self._build_ui()
         self._poll_messages()
@@ -219,6 +225,40 @@ class TransferSummaryDesktop:
                     self.messages.put(("log", f"  注意: {warning}"))
                 self.messages.put(("overall_progress", f"{index}|{len(files)}|100"))
 
+            review_records = [
+                record
+                for voucher in vouchers
+                for record in voucher.get("transfer_records", [])
+                if record.get("needs_review")
+            ]
+            if review_records or total_records == 0:
+                confidence_values = [
+                    float(record.get("confidence") or 0.0)
+                    for record in review_records
+                ]
+                minimum_confidence = min(confidence_values) if confidence_values else None
+                score_text = f"{minimum_confidence * 100:.1f}%" if minimum_confidence is not None else "-"
+                self.validation_confirmed = False
+                self.validation_confirmation_event = threading.Event()
+                self.messages.put(
+                    (
+                        "validation_required",
+                        {
+                            "vouchers": vouchers,
+                            "files": files,
+                            "score_text": score_text,
+                            "threshold_text": f"{settings.ocr_confidence_threshold * 100:.1f}%",
+                            "review_count": len(review_records),
+                            "total_records": total_records,
+                        },
+                    )
+                )
+                self.validation_confirmation_event.wait()
+                if not self.validation_confirmed:
+                    self.messages.put(("cancelled", "Validation の確認が完了しなかったため、Excel 出力を中止しました。"))
+                    return
+
+            total_records = sum(len(voucher.get("transfer_records", [])) for voucher in vouchers)
             export_path = export_transfer_summary_xlsx(vouchers)
             self.last_export_path = export_path
             self.messages.put(("done", f"完了: {len(files)}ファイル / {total_records}行\n{export_path}"))
@@ -252,6 +292,8 @@ class TransferSummaryDesktop:
             elif kind == "overall_progress":
                 index_text, total_text, percent_text = value.split("|", 2)
                 self._update_overall_progress(int(index_text) - 1, int(total_text), float(percent_text))
+            elif kind == "validation_required":
+                self._open_validation_review_dialog(value)
             elif kind == "done":
                 self.processing = False
                 self.process_button.configure(state="normal")
@@ -267,7 +309,389 @@ class TransferSummaryDesktop:
                 self._set_status("エラーが発生しました")
                 self._append_log(value)
                 messagebox.showerror("処理エラー", value)
+            elif kind == "cancelled":
+                self.processing = False
+                self.process_button.configure(state="normal")
+                self.eta_label.configure(text="残り時間: -")
+                self._set_status("確認未完了のため出力を中止しました")
+                self._append_log(value)
         self.root.after(150, self._poll_messages)
+
+    def _open_validation_review_dialog(self, payload: dict[str, Any]) -> None:
+        if self.validation_dialog is not None and self.validation_dialog.winfo_exists():
+            self.validation_dialog.lift()
+            return
+
+        vouchers = payload["vouchers"]
+        source_paths = list(payload["files"])
+        review_rows = self._flatten_review_rows(vouchers)
+        if not review_rows:
+            review_rows.append(self._empty_review_row(vouchers, 0))
+
+        dialog = tk.Toplevel(self.root)
+        self.validation_dialog = dialog
+        dialog.title("Validation 確認 - 抽出内容の確認・修正")
+        dialog.geometry("1480x820")
+        dialog.minsize(1120, 660)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.columnconfigure(0, weight=1)
+        dialog.rowconfigure(1, weight=1)
+
+        header = ttk.Frame(dialog, padding=(18, 16, 18, 8))
+        header.grid(row=0, column=0, sticky="ew")
+        header.columnconfigure(0, weight=1)
+        ttk.Label(header, text="Validation 確認が必要です", font=("", 17, "bold")).grid(row=0, column=0, sticky=W)
+        if payload["total_records"] == 0:
+            result_summary = "陸送情報が抽出されませんでした。元伝票を確認して、必要な行を追加してください。"
+        else:
+            result_summary = (
+                f"確認対象: {payload['review_count']}行 / "
+                f"最低信頼度: {payload['score_text']} / 基準: {payload['threshold_text']}"
+            )
+        ttk.Label(header, text=result_summary).grid(row=1, column=0, sticky=W, pady=(8, 0))
+        ttk.Label(
+            header,
+            text="元ファイルと照合し、誤りや未記載項目を修正してから「確認済みとして Excel 出力」を押してください。",
+        ).grid(row=2, column=0, sticky=W, pady=(6, 0))
+
+        content = ttk.PanedWindow(dialog, orient=tk.HORIZONTAL)
+        content.grid(row=1, column=0, sticky="nsew", padx=18, pady=8)
+
+        preview_frame = ttk.LabelFrame(content, text="元伝票プレビュー", padding=10)
+        preview_frame.columnconfigure(0, weight=1)
+        preview_frame.rowconfigure(1, weight=1)
+        preview_controls = ttk.Frame(preview_frame)
+        preview_controls.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        preview_status = ttk.Label(preview_controls, text="表示するファイルを選択してください")
+        preview_status.pack(side=LEFT, fill=X, expand=True)
+        preview_canvas = tk.Canvas(preview_frame, background="#f2f2f2", highlightthickness=0)
+        preview_canvas.grid(row=1, column=0, sticky="nsew")
+        preview_v_scroll = ttk.Scrollbar(preview_frame, orient=VERTICAL, command=preview_canvas.yview)
+        preview_v_scroll.grid(row=1, column=1, sticky="ns")
+        preview_h_scroll = ttk.Scrollbar(preview_frame, orient=tk.HORIZONTAL, command=preview_canvas.xview)
+        preview_h_scroll.grid(row=2, column=0, sticky="ew")
+        preview_canvas.configure(yscrollcommand=preview_v_scroll.set, xscrollcommand=preview_h_scroll.set)
+        content.add(preview_frame, weight=4)
+
+        review_frame = ttk.Frame(content, padding=1)
+        review_frame.columnconfigure(0, weight=1)
+        review_frame.rowconfigure(0, weight=1)
+        review_content = ttk.PanedWindow(review_frame, orient=tk.VERTICAL)
+        review_content.grid(row=0, column=0, sticky="nsew")
+
+        list_frame = ttk.Frame(review_content, padding=1)
+        list_frame.columnconfigure(0, weight=1)
+        list_frame.rowconfigure(1, weight=1)
+        list_actions = ttk.Frame(list_frame)
+        list_actions.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        ttk.Label(list_actions, text="抽出結果一覧", font=("", 11, "bold")).pack(side=LEFT)
+        columns = (
+            "source_filename",
+            "vehicle_model",
+            "vehicle_number",
+            "pickup_datetime",
+            "pickup_location",
+            "delivery_datetime",
+            "delivery_location",
+            "confidence",
+        )
+        tree = ttk.Treeview(list_frame, columns=columns, show="headings", selectmode="browse", height=9)
+        headings = {
+            "source_filename": "ファイル名",
+            "vehicle_model": "車種",
+            "vehicle_number": "車番/VIN",
+            "pickup_datetime": "搬出日時",
+            "pickup_location": "搬出場所",
+            "delivery_datetime": "搬入日時",
+            "delivery_location": "搬入場所",
+            "confidence": "信頼度",
+        }
+        widths = {
+            "source_filename": 150,
+            "vehicle_model": 120,
+            "vehicle_number": 120,
+            "pickup_datetime": 125,
+            "pickup_location": 170,
+            "delivery_datetime": 125,
+            "delivery_location": 170,
+            "confidence": 70,
+        }
+        for column in columns:
+            tree.heading(column, text=headings[column])
+            tree.column(column, width=widths[column], minwidth=70, stretch=column in {"pickup_location", "delivery_location"})
+        tree.grid(row=1, column=0, sticky="nsew")
+        tree_scroll = ttk.Scrollbar(list_frame, orient=VERTICAL, command=tree.yview)
+        tree_scroll.grid(row=1, column=1, sticky="ns")
+        tree.configure(yscrollcommand=tree_scroll.set)
+        review_content.add(list_frame, weight=3)
+
+        edit_frame = ttk.LabelFrame(review_content, text="選択行の確認・修正", padding=14)
+        for column in range(4):
+            edit_frame.columnconfigure(column, weight=1)
+        entries: dict[str, ttk.Entry] = {}
+        entry_fields = [
+            ("vehicle_model", "車種"),
+            ("vehicle_number", "車番/VIN"),
+            ("pickup_datetime", "搬出日時"),
+            ("pickup_location", "搬出場所"),
+            ("delivery_datetime", "搬入日時"),
+            ("delivery_location", "搬入場所"),
+            ("notes", "備考"),
+        ]
+        for index, (field, label_text) in enumerate(entry_fields):
+            row_index = (index // 4) * 2
+            column_index = index % 4
+            ttk.Label(edit_frame, text=label_text).grid(row=row_index, column=column_index, sticky=W, padx=(0, 10), pady=(0, 4))
+            entry = ttk.Entry(edit_frame)
+            entry.grid(row=row_index + 1, column=column_index, sticky="ew", padx=(0, 10), pady=(0, 10))
+            entries[field] = entry
+        review_content.add(edit_frame, weight=2)
+        content.add(review_frame, weight=5)
+
+        selected_index: list[int | None] = [None]
+        preview_path: list[Path | None] = [None]
+        preview_page: list[int] = [0]
+        preview_zoom: list[float] = [0.85]
+        preview_photo: list[ImageTk.PhotoImage | None] = [None]
+
+        def render_preview(reset_page: bool = False) -> None:
+            path = preview_path[0]
+            if path is None or not path.exists():
+                preview_canvas.delete("all")
+                preview_photo[0] = None
+                preview_status.configure(text="元ファイルを表示できません")
+                return
+            if reset_page:
+                preview_page[0] = 0
+            try:
+                image, page_number, page_count = self._load_preview_image(path, preview_page[0], preview_zoom[0])
+            except Exception as exc:  # noqa: BLE001
+                preview_canvas.delete("all")
+                preview_photo[0] = None
+                preview_status.configure(text=f"プレビュー表示に失敗しました: {type(exc).__name__}")
+                return
+            preview_page[0] = page_number
+            preview_photo[0] = ImageTk.PhotoImage(image)
+            preview_canvas.delete("all")
+            preview_canvas.create_image(0, 0, image=preview_photo[0], anchor="nw")
+            preview_canvas.configure(scrollregion=(0, 0, image.width, image.height))
+            page_text = f" / {page_count} ページ" if page_count > 1 else ""
+            preview_status.configure(
+                text=f"{path.name}  {page_number + 1}{page_text}  ({preview_zoom[0] * 100:.0f}%)"
+            )
+
+        def shift_preview_page(offset: int) -> None:
+            preview_page[0] += offset
+            render_preview()
+
+        def change_preview_zoom(multiplier: float) -> None:
+            preview_zoom[0] = max(0.35, min(2.2, preview_zoom[0] * multiplier))
+            render_preview()
+
+        ttk.Button(preview_controls, text="前ページ", command=lambda: shift_preview_page(-1)).pack(side=RIGHT, padx=(5, 0))
+        ttk.Button(preview_controls, text="次ページ", command=lambda: shift_preview_page(1)).pack(side=RIGHT, padx=(5, 0))
+        ttk.Button(preview_controls, text="縮小", command=lambda: change_preview_zoom(0.8)).pack(side=RIGHT, padx=(5, 0))
+        ttk.Button(preview_controls, text="拡大", command=lambda: change_preview_zoom(1.25)).pack(side=RIGHT, padx=(5, 0))
+
+        def row_values(row: dict[str, Any]) -> tuple[str, ...]:
+            confidence = row["record"].get("confidence")
+            confidence_text = f"{float(confidence) * 100:.1f}%" if confidence is not None else "-"
+            return (
+                row["source_filename"],
+                str(row["record"].get("vehicle_model") or ""),
+                str(row["record"].get("vehicle_number") or ""),
+                str(row["record"].get("pickup_datetime") or ""),
+                str(row["record"].get("pickup_location") or ""),
+                str(row["record"].get("delivery_datetime") or ""),
+                str(row["record"].get("delivery_location") or ""),
+                confidence_text,
+            )
+
+        def refresh_tree(select_index: int | None = None) -> None:
+            for item_id in tree.get_children():
+                tree.delete(item_id)
+            for index, row in enumerate(review_rows):
+                tree.insert("", END, iid=str(index), values=row_values(row))
+            if review_rows:
+                index = select_index if select_index is not None and select_index < len(review_rows) else 0
+                tree.selection_set(str(index))
+                tree.focus(str(index))
+                load_selected()
+
+        def save_entries() -> None:
+            index = selected_index[0]
+            if index is None or index >= len(review_rows):
+                return
+            record = review_rows[index]["record"]
+            for field, entry in entries.items():
+                record[field] = entry.get().strip() or None
+            record["needs_review"] = False
+            record["review_status"] = "REVIEWED"
+            record["validation_json"] = {
+                **(record.get("validation_json") or {}),
+                "manual_confirmation_completed": True,
+                "needs_review": False,
+            }
+            tree.item(str(index), values=row_values(review_rows[index]))
+
+        def load_selected(_event: object | None = None) -> None:
+            selection = tree.selection()
+            if not selection:
+                return
+            new_index = int(selection[0])
+            if selected_index[0] is not None and selected_index[0] != new_index:
+                save_entries()
+            selected_index[0] = new_index
+            record = review_rows[new_index]["record"]
+            for field, entry in entries.items():
+                entry.delete(0, END)
+                entry.insert(0, str(record.get(field) or ""))
+            voucher_index = int(review_rows[new_index]["voucher_index"])
+            source_path = source_paths[voucher_index] if 0 <= voucher_index < len(source_paths) else None
+            if source_path != preview_path[0]:
+                preview_path[0] = source_path
+                preview_zoom[0] = 0.85
+                render_preview(reset_page=True)
+
+        def add_row() -> None:
+            save_entries()
+            review_rows.append(self._empty_review_row(vouchers, 0))
+            refresh_tree(len(review_rows) - 1)
+
+        def delete_row() -> None:
+            selection = tree.selection()
+            if not selection:
+                return
+            del review_rows[int(selection[0])]
+            selected_index[0] = None
+            if not review_rows:
+                review_rows.append(self._empty_review_row(vouchers, 0))
+            refresh_tree()
+
+        def open_source() -> None:
+            selection = tree.selection()
+            if not selection:
+                return
+            voucher_index = int(review_rows[int(selection[0])]["voucher_index"])
+            source_path = source_paths[voucher_index] if 0 <= voucher_index < len(source_paths) else None
+            if source_path and source_path.exists():
+                os.startfile(source_path)  # type: ignore[attr-defined]
+            else:
+                messagebox.showinfo("元ファイルなし", "選択した行の元ファイルを開けません。", parent=dialog)
+
+        def complete_review() -> None:
+            save_entries()
+            active_rows = [
+                row
+                for row in review_rows
+                if any(
+                    row["record"].get(field)
+                    for field in ("vehicle_model", "vehicle_number", "pickup_location", "delivery_location")
+                )
+            ]
+            if not active_rows:
+                messagebox.showwarning("陸送情報未入力", "確認後の陸送情報を 1 行以上入力してください。", parent=dialog)
+                return
+            for row in active_rows:
+                record = row["record"]
+                record["needs_review"] = False
+                record["review_status"] = "REVIEWED"
+                record["validation_json"] = {
+                    **(record.get("validation_json") or {}),
+                    "manual_confirmation_completed": True,
+                    "needs_review": False,
+                }
+            self._apply_review_rows(vouchers, active_rows)
+            self.validation_confirmed = True
+            self._append_log(f"Validation 確認完了: {len(active_rows)}行を Excel 出力対象として保存します。")
+            close_dialog()
+
+        def cancel_review() -> None:
+            self.validation_confirmed = False
+            close_dialog()
+
+        def close_dialog() -> None:
+            dialog.grab_release()
+            dialog.destroy()
+            self.validation_dialog = None
+            if self.validation_confirmation_event is not None:
+                self.validation_confirmation_event.set()
+
+        ttk.Button(list_actions, text="元ファイルを開く", command=open_source).pack(side=RIGHT, padx=(8, 0))
+        ttk.Button(list_actions, text="行を削除", command=delete_row).pack(side=RIGHT, padx=(8, 0))
+        ttk.Button(list_actions, text="行を追加", command=add_row).pack(side=RIGHT, padx=(8, 0))
+        tree.bind("<<TreeviewSelect>>", load_selected)
+
+        footer = ttk.Frame(dialog, padding=(18, 8, 18, 16))
+        footer.grid(row=2, column=0, sticky="ew")
+        ttk.Button(footer, text="出力を中止", command=cancel_review).pack(side=RIGHT)
+        ttk.Button(footer, text="確認済みとして Excel 出力", command=complete_review).pack(side=RIGHT, padx=(0, 10))
+        dialog.protocol("WM_DELETE_WINDOW", cancel_review)
+        refresh_tree()
+
+    @staticmethod
+    def _flatten_review_rows(vouchers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for voucher_index, voucher in enumerate(vouchers):
+            for record in voucher.get("transfer_records", []):
+                rows.append(
+                    {
+                        "voucher_index": voucher_index,
+                        "source_filename": voucher.get("source_filename") or "",
+                        "record": dict(record),
+                    }
+                )
+        return rows
+
+    @staticmethod
+    def _empty_review_row(vouchers: list[dict[str, Any]], voucher_index: int) -> dict[str, Any]:
+        source_filename = vouchers[voucher_index].get("source_filename") if vouchers else ""
+        return {
+            "voucher_index": voucher_index,
+            "source_filename": source_filename or "",
+            "record": {
+                "vehicle_model": None,
+                "vehicle_number": None,
+                "pickup_datetime": None,
+                "pickup_location": None,
+                "delivery_datetime": None,
+                "delivery_location": None,
+                "confidence": 1.0,
+                "needs_review": False,
+                "notes": None,
+                "validation_json": {"manual_confirmation_completed": True, "needs_review": False},
+            },
+        }
+
+    @staticmethod
+    def _apply_review_rows(vouchers: list[dict[str, Any]], review_rows: list[dict[str, Any]]) -> None:
+        for voucher in vouchers:
+            voucher["transfer_records"] = []
+        for row in review_rows:
+            voucher_index = int(row["voucher_index"])
+            if 0 <= voucher_index < len(vouchers):
+                vouchers[voucher_index]["transfer_records"].append(row["record"])
+
+    @staticmethod
+    def _load_preview_image(source_path: Path, page_number: int, zoom: float) -> tuple[Image.Image, int, int]:
+        zoom = max(0.35, min(2.2, float(zoom)))
+        if source_path.suffix.lower() == ".pdf":
+            import fitz
+
+            with fitz.open(source_path) as document:
+                if document.page_count < 1:
+                    raise ValueError("PDF has no pages")
+                page_number = max(0, min(int(page_number), document.page_count - 1))
+                pixmap = document.load_page(page_number).get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+                image = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
+                return image, page_number, document.page_count
+
+        with Image.open(source_path) as original:
+            image = original.convert("RGB")
+        width = max(1, int(image.width * zoom))
+        height = max(1, int(image.height * zoom))
+        return image.resize((width, height), Image.Resampling.LANCZOS), 0, 1
 
     def _queue_ocr_progress(self, file_index: int, total_files: int, message: str, percent: float | None) -> None:
         if percent is None:
