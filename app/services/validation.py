@@ -6,6 +6,13 @@ from ..config import settings
 from ..schemas import ExtractionResult
 
 
+REQUIRED_FIELDS_BY_TYPE = {
+    "invoice": {"issue_date", "vendor_name", "grand_total"},
+    "delivery": {"issue_date", "vendor_name", "customer_name"},
+    "journal": {"issue_date", "notes"},
+}
+
+
 def _to_float(value: Any) -> float | None:
     if value is None or value == "":
         return None
@@ -17,6 +24,7 @@ def _to_float(value: Any) -> float | None:
 
 def validate_extraction(result: ExtractionResult) -> dict[str, Any]:
     warnings = list(result.warnings)
+    required_fields = REQUIRED_FIELDS_BY_TYPE.get(result.voucher_type, REQUIRED_FIELDS_BY_TYPE["invoice"])
     field_values = {key: field.value for key, field in result.fields.items()}
     subtotal = _to_float(field_values.get("subtotal"))
     tax = _to_float(field_values.get("tax"))
@@ -39,14 +47,19 @@ def validate_extraction(result: ExtractionResult) -> dict[str, Any]:
     if result.fields.get("currency") and result.fields["currency"].value is None:
         result.fields["currency"].value = "JPY"
 
-    needs_review = any(field.needs_review for field in result.fields.values()) or any(
+    review_fields = [
+        field
+        for key, field in result.fields.items()
+        if key in required_fields or key != "notes"
+    ]
+    needs_review = any(field.needs_review for field in review_fields) or any(
         item.needs_review or item.confidence < settings.ocr_confidence_threshold for item in result.items
     )
     needs_review = needs_review or bool(warnings)
     assessed_confidences = [
         field.confidence
-        for field in result.fields.values()
-        if field.value not in (None, "")
+        for key, field in result.fields.items()
+        if field.value not in (None, "") and (key in required_fields or key != "notes")
     ]
     assessed_confidences.extend(
         item.confidence

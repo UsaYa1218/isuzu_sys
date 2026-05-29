@@ -14,7 +14,7 @@ FIELD_SPECS: dict[str, dict[str, dict[str, Any]]] = {
     "invoice": {
         "issue_date": {"labels": ["発行日", "請求日", "日付"], "type": "date", "required": True},
         "due_date": {"labels": ["支払期限", "支払日", "お支払期限"], "type": "date", "required": False},
-        "document_number": {"labels": ["請求書番号", "請求No", "No.", "No"], "type": "text", "required": True},
+        "document_number": {"labels": ["請求書番号", "請求No", "No.", "No"], "type": "text", "required": False},
         "vendor_name": {"labels": ["発行者", "請求元", "差出人", "株式会社"], "type": "text", "required": True},
         "customer_name": {"labels": ["請求先", "御中", "宛先"], "type": "text", "required": False},
         "currency": {"labels": ["通貨", "Currency"], "type": "currency", "required": False},
@@ -26,7 +26,7 @@ FIELD_SPECS: dict[str, dict[str, dict[str, Any]]] = {
     },
     "delivery": {
         "issue_date": {"labels": ["納品日", "日付"], "type": "date", "required": True},
-        "document_number": {"labels": ["納品書番号", "伝票番号", "No."], "type": "text", "required": True},
+        "document_number": {"labels": ["納品書番号", "伝票番号", "No."], "type": "text", "required": False},
         "vendor_name": {"labels": ["出荷元", "送付元", "発行者"], "type": "text", "required": True},
         "customer_name": {"labels": ["納品先", "宛先"], "type": "text", "required": True},
         "notes": {"labels": ["備考"], "type": "text", "required": False},
@@ -34,7 +34,7 @@ FIELD_SPECS: dict[str, dict[str, dict[str, Any]]] = {
     },
     "journal": {
         "issue_date": {"labels": ["伝票日付", "日付"], "type": "date", "required": True},
-        "document_number": {"labels": ["伝票番号", "No."], "type": "text", "required": True},
+        "document_number": {"labels": ["伝票番号", "No."], "type": "text", "required": False},
         "vendor_name": {"labels": ["起票者", "部門"], "type": "text", "required": False},
         "notes": {"labels": ["摘要", "備考"], "type": "text", "required": True},
         "grand_total": {"labels": ["借方合計", "貸方合計"], "type": "money", "required": False},
@@ -795,9 +795,11 @@ def extract_document(voucher_type: str, lines: list[OCRLine], tables: list[Extra
 
     warnings: list[str] = []
     for key, field in fields.items():
-        if field.value is None and specs.get(key, {}).get("required", False):
+        required = specs.get(key, {}).get("required", False)
+        review_relevant = required or (key != "notes" and field.value not in (None, ""))
+        if field.value is None and required:
             warnings.append(f"必須項目 {key} を抽出できませんでした。")
-        if field.confidence < settings.ocr_confidence_threshold:
+        if field.confidence < settings.ocr_confidence_threshold and review_relevant:
             warnings.append(f"{key} の OCR 信頼度が閾値未満です。")
 
     return ExtractionResult(
