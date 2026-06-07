@@ -52,6 +52,31 @@ class VoucherItemDraft:
 
 
 @dataclass(slots=True)
+class TransferRecordDraft:
+    vehicle_model: str | None = None
+    vehicle_number: str | None = None
+    pickup_datetime: str | None = None
+    pickup_location: str | None = None
+    delivery_datetime: str | None = None
+    delivery_location: str | None = None
+    confidence: float = 0.0
+    needs_review: bool = True
+    review_status: str = "NEEDS_REVIEW"
+    notes: str | None = None
+    validation_json: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class ContextHint:
+    kind: str
+    value: str
+    reason: str = ""
+    confidence: float = 0.0
+    field_key: str | None = None
+    source: str = "llm"
+
+
+@dataclass(slots=True)
 class ExtractedTable:
     page: int
     table_index: int
@@ -70,6 +95,7 @@ class ExtractionResult:
     raw_text: str = ""
     ocr_lines: list[OCRLine] = field(default_factory=list)
     tables: list[ExtractedTable] = field(default_factory=list)
+    context_hints: list[ContextHint] = field(default_factory=list)
     llm_used: bool = False
     llm_status: str = "unused"
     llm_messages: list[str] = field(default_factory=list)
@@ -83,6 +109,7 @@ class ExtractionResult:
             "raw_text": self.raw_text,
             "ocr_lines": [asdict(line) for line in self.ocr_lines],
             "tables": [asdict(table) for table in self.tables],
+            "context_hints": [asdict(hint) for hint in self.context_hints],
             "llm_used": self.llm_used,
             "llm_status": self.llm_status,
             "llm_messages": self.llm_messages,

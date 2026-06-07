@@ -5,6 +5,9 @@
 {% set tables = voucher.document_json["tables"] %}
 {% set type_label = voucher_type_labels.get(voucher.type, voucher.type) %}
 {% set status_label = status_labels.get(voucher.status, voucher.status) %}
+{% set manual_confirmation_required = validation.get("manual_confirmation_required", voucher.needs_review) %}
+{% set manual_confirmation_completed = validation.get("manual_confirmation_completed", false) %}
+{% set output_blocked = manual_confirmation_required and not manual_confirmation_completed %}
 
 <section class="panel detail-hero">
   <div>
@@ -19,11 +22,59 @@
       {% endif %}
     </p>
   </div>
+  {% if not demo_empty_result %}
   <div class="action-row">
+    {% if output_blocked %}
+    <span class="pill review-pill">確認完了後に出力可能</span>
+    {% else %}
     <a class="ghost-button" href="/vouchers/{{ voucher.id }}/export/xlsx">Excel出力</a>
     <a class="ghost-button" href="/vouchers/{{ voucher.id }}/export/csv">CSV(zip)出力</a>
+    {% endif %}
   </div>
+  {% endif %}
 </section>
+
+{% if voucher.status != "OCR_PROCESSING" %}
+<section class="panel validation-panel{% if output_blocked %} validation-panel-warning{% endif %}">
+  <div class="panel-header">
+    <div>
+      <p class="eyebrow">Validation</p>
+      <h2>読み取り結果の検証</h2>
+      <p class="section-note">抽出項目と陸送情報のうち、判定対象となった最低信頼度を表示しています。</p>
+    </div>
+    {% if validation.get("confidence_score") is not none %}
+    <strong class="validation-score">{{ "%.1f"|format(validation.confidence_score * 100) }}%</strong>
+    {% else %}
+    <strong class="validation-score">-</strong>
+    {% endif %}
+  </div>
+  <div class="validation-metrics">
+    <div>
+      <span>確認基準</span>
+      <strong>{{ "%.1f"|format(validation.get("confidence_threshold", settings.ocr_confidence_threshold) * 100) }}%</strong>
+    </div>
+    <div>
+      <span>陸送行</span>
+      <strong>{{ validation.get("transfer_record_count", voucher.transfer_records|length) }}件</strong>
+    </div>
+    <div>
+      <span>判定</span>
+      {% if output_blocked %}
+      <strong class="validation-attention">確認必須</strong>
+      {% elif manual_confirmation_required %}
+      <strong>確認済み</strong>
+      {% else %}
+      <strong>自動確認可</strong>
+      {% endif %}
+    </div>
+  </div>
+  {% if output_blocked %}
+  <p class="validation-message">基準未満の信頼度または確認事項があります。元伝票と照合して確認内容を保存するまで、承認と出力はできません。</p>
+  {% elif manual_confirmation_required %}
+  <p class="validation-message validation-completed">確認が保存されています。承認または出力へ進めます。</p>
+  {% endif %}
+</section>
+{% endif %}
 
 {% if validation.warnings %}
 <section class="panel warning-panel">
@@ -39,7 +90,7 @@
 {% if source_preview_kind %}
 <section class="panel preview-panel">
   <div class="panel-header">
-    <h2>元PDF / 画像</h2>
+    <h2>PDFレビュー</h2>
     <a class="ghost-button" href="{{ source_preview_url }}" target="_blank" rel="noopener noreferrer">別タブで開く</a>
   </div>
   {% if source_preview_kind == "pdf" %}
@@ -48,12 +99,24 @@
   <img class="source-preview-image" src="{{ source_preview_url }}" alt="元画像プレビュー" />
   {% endif %}
 </section>
+{% elif demo_empty_result %}
+<section class="panel preview-panel">
+  <div class="panel-header">
+    <h2>PDFレビュー</h2>
+    <span class="pill review-pill">実PDFなし</span>
+  </div>
+  <div class="pdf-placeholder">
+    <p class="eyebrow">Sample</p>
+    <h3>中間報告用の空データ表示</h3>
+    <p>実際のPDFは使用せず、抽出対象項目と空欄の表示状態だけを確認するための画面です。</p>
+  </div>
+</section>
 {% endif %}
 
 {% if tables %}
 <section class="panel">
   <div class="panel-header">
-    <h2>抽出された表</h2>
+    <h2>抽出した表</h2>
     <span class="pill">{{ tables|length }}件</span>
   </div>
   {% for table in tables %}
@@ -220,9 +283,84 @@
         </div>
       </section>
 
+      <section class="form-section">
+        <div class="panel-header compact">
+          <div>
+            <h3>陸送情報</h3>
+            <p class="section-note">車種・車番・引取/搬入の日時と場所を確認します。</p>
+          </div>
+          <button type="button" class="ghost-button" data-add-transfer-row>陸送行を追加</button>
+        </div>
+
+        <div class="table-wrap">
+          <table id="transfer-table">
+            <thead>
+              <tr>
+                <th>車種</th>
+                <th>車番/VIN</th>
+                <th>引取日時</th>
+                <th>引取場所</th>
+                <th>搬入日時</th>
+                <th>搬入場所</th>
+                <th>備考</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for record in voucher.transfer_records %}
+              <tr>
+                <td>
+                  <input type="hidden" name="transfer_id" value="{{ record.id }}" />
+                  <input name="transfer_vehicle_model" value="{{ record.vehicle_model or '' }}" />
+                </td>
+                <td><input name="transfer_vehicle_number" value="{{ record.vehicle_number or '' }}" /></td>
+                <td><input name="transfer_pickup_datetime" value="{{ record.pickup_datetime or '' }}" /></td>
+                <td><input name="transfer_pickup_location" value="{{ record.pickup_location or '' }}" /></td>
+                <td><input name="transfer_delivery_datetime" value="{{ record.delivery_datetime or '' }}" /></td>
+                <td><input name="transfer_delivery_location" value="{{ record.delivery_location or '' }}" /></td>
+                <td><input name="transfer_notes" value="{{ record.notes or '' }}" /></td>
+              </tr>
+              {% endfor %}
+              {% if not voucher.transfer_records %}
+              <tr>
+                <td>
+                  <input type="hidden" name="transfer_id" value="" />
+                  <input name="transfer_vehicle_model" value="" />
+                </td>
+                <td><input name="transfer_vehicle_number" value="" /></td>
+                <td><input name="transfer_pickup_datetime" value="" /></td>
+                <td><input name="transfer_pickup_location" value="" /></td>
+                <td><input name="transfer_delivery_datetime" value="" /></td>
+                <td><input name="transfer_delivery_location" value="" /></td>
+                <td><input name="transfer_notes" value="" /></td>
+              </tr>
+              {% endif %}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      {% if manual_confirmation_required %}
+      <section class="form-section confirmation-panel">
+        <h3>Validation 確認</h3>
+        <label class="confirmation-checkbox">
+          <input
+            type="checkbox"
+            name="manual_confirmation_completed"
+            value="true"
+            {% if manual_confirmation_completed %}checked{% endif %}
+            required
+          />
+          <span>元伝票と抽出結果を照合し、低信頼度項目・未記載項目・表記ゆれを確認しました。</span>
+        </label>
+        <p class="section-note">この確認を保存するまで、承認待ちへの変更および Excel/CSV 出力は実行できません。</p>
+      </section>
+      {% endif %}
+
+      {% if not demo_empty_result %}
       <div class="action-row">
         <button type="submit">確認内容を保存</button>
       </div>
+      {% endif %}
     </form>
   </section>
 
@@ -259,13 +397,36 @@
       <dd>{{ voucher.created_at }}</dd>
     </dl>
 
+    {% if voucher.document_json.context_hints %}
+    <h2>LLM Context Hints</h2>
+    <div class="audit-list">
+      {% for hint in voucher.document_json.context_hints %}
+      <article class="audit-item">
+        <strong>{{ hint.kind }}</strong>
+        <p>{{ hint.value }}</p>
+        {% if hint.field_key %}
+        <p>field: {{ hint.field_key }}</p>
+        {% endif %}
+        {% if hint.reason %}
+        <p>{{ hint.reason }}</p>
+        {% endif %}
+      </article>
+      {% endfor %}
+    </div>
+    {% endif %}
+
+    {% if not demo_empty_result %}
     <h2>状態変更</h2>
+    {% if output_blocked %}
+    <p class="validation-message">Validation の確認内容を保存すると、承認操作を実行できます。</p>
+    {% endif %}
     <form action="/vouchers/{{ voucher.id }}/transition" method="post" class="stack">
-      <button type="submit" name="action" value="submit">承認待ちにする</button>
-      <button type="submit" name="action" value="approve">承認する</button>
+      <button type="submit" name="action" value="submit" {% if output_blocked %}disabled{% endif %}>承認待ちにする</button>
+      <button type="submit" name="action" value="approve" {% if output_blocked %}disabled{% endif %}>承認する</button>
       <button type="submit" name="action" value="reject" class="danger">差戻しにする</button>
       <button type="submit" name="action" value="reopen" class="ghost-button">レビューに戻す</button>
     </form>
+    {% endif %}
 
     <h2>監査ログ</h2>
     <div class="audit-list">

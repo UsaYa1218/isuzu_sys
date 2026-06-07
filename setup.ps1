@@ -1,6 +1,7 @@
 param(
     [string]$PythonVersion = "3.12",
     [string]$OllamaModel = "qwen2.5:7b",
+    [switch]$UseCpuPaddle,
     [switch]$SkipInstaller
 )
 
@@ -66,11 +67,24 @@ if (-not (Test-Path ".venv\Scripts\python.exe")) {
 
 & ".\.venv\Scripts\python.exe" -m pip install --upgrade pip
 & ".\.venv\Scripts\python.exe" -m pip install -r requirements.txt
-& ".\.venv\Scripts\python.exe" -m pip install paddlepaddle==3.2.0 -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
+if ($UseCpuPaddle) {
+    & ".\.venv\Scripts\python.exe" -m pip install paddlepaddle==3.2.0 -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
+}
+else {
+    if (Test-CommandExists "nvidia-smi") {
+        & ".\.venv\Scripts\python.exe" -m pip install paddlepaddle-gpu==3.2.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
+    }
+    else {
+        Write-Host "nvidia-smi was not found. Installing CPU PaddlePaddle. Use the packaged app on the GPU PC to auto-detect and install GPU packages."
+        & ".\.venv\Scripts\python.exe" -m pip install paddlepaddle==3.2.0 -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
+    }
+}
 
 New-Item -ItemType Directory -Force -Path "runtime" | Out-Null
 New-Item -ItemType Directory -Force -Path "runtime\uploads" | Out-Null
 New-Item -ItemType Directory -Force -Path "runtime\exports" | Out-Null
+New-Item -ItemType Directory -Force -Path "runtime\inbox" | Out-Null
+New-Item -ItemType Directory -Force -Path "runtime\processed" | Out-Null
 New-Item -ItemType Directory -Force -Path "runtime\paddleocr" | Out-Null
 New-Item -ItemType Directory -Force -Path "runtime\tmp" | Out-Null
 

@@ -15,9 +15,10 @@ def _dict_factory(cursor: sqlite3.Cursor, row: tuple[Any, ...]) -> dict[str, Any
 
 def get_connection() -> sqlite3.Connection:
     settings.database_path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(settings.database_path)
+    connection = sqlite3.connect(settings.database_path, timeout=30)
     connection.row_factory = _dict_factory
     connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA busy_timeout = 30000")
     return connection
 
 
@@ -37,10 +38,12 @@ def now_iso() -> str:
 
 def init_db() -> None:
     with connection_scope() as connection:
+        connection.execute("PRAGMA journal_mode = WAL")
         connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS vouchers (
                 id TEXT PRIMARY KEY,
+                batch_id TEXT,
                 type TEXT NOT NULL,
                 status TEXT NOT NULL,
                 needs_review INTEGER NOT NULL DEFAULT 0,
@@ -87,8 +90,32 @@ def init_db() -> None:
                 detail_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS transfer_records (
+                id TEXT PRIMARY KEY,
+                voucher_id TEXT NOT NULL REFERENCES vouchers(id) ON DELETE CASCADE,
+                line_no INTEGER NOT NULL,
+                vehicle_model TEXT,
+                vehicle_number TEXT,
+                pickup_datetime TEXT,
+                pickup_location TEXT,
+                delivery_datetime TEXT,
+                delivery_location TEXT,
+                confidence REAL DEFAULT 0,
+                needs_review INTEGER NOT NULL DEFAULT 1,
+                review_status TEXT NOT NULL DEFAULT 'NEEDS_REVIEW',
+                notes TEXT,
+                validation_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                reviewed_by TEXT,
+                reviewed_at TEXT
+            );
             """
         )
+        columns = {row["name"] for row in connection.execute("PRAGMA table_info(vouchers)").fetchall()}
+        if "batch_id" not in columns:
+            connection.execute("ALTER TABLE vouchers ADD COLUMN batch_id TEXT")
 
 
 def fetch_all_vouchers() -> list[dict[str, Any]]:
@@ -97,6 +124,7 @@ def fetch_all_vouchers() -> list[dict[str, Any]]:
             """
             SELECT
                 id,
+                batch_id,
                 type,
                 status,
                 needs_review,
@@ -114,7 +142,23 @@ def fetch_all_vouchers() -> list[dict[str, Any]]:
             ORDER BY created_at DESC
             """
         )
-        return cursor.fetchall()
+        vouchers = cursor.fetchall()
+        counts = connection.execute(
+            """
+            SELECT
+                voucher_id,
+                COUNT(*) AS transfer_record_count,
+                SUM(CASE WHEN needs_review = 1 THEN 1 ELSE 0 END) AS transfer_review_count
+            FROM transfer_records
+            GROUP BY voucher_id
+            """
+        ).fetchall()
+        count_map = {row["voucher_id"]: row for row in counts}
+        for voucher in vouchers:
+            row = count_map.get(voucher["id"], {})
+            voucher["transfer_record_count"] = row.get("transfer_record_count", 0)
+            voucher["transfer_review_count"] = row.get("transfer_review_count", 0) or 0
+        return vouchers
 
 
 def fetch_voucher(voucher_id: str) -> dict[str, Any] | None:
@@ -140,6 +184,15 @@ def fetch_voucher(voucher_id: str) -> dict[str, Any] | None:
             """,
             (voucher_id,),
         ).fetchall()
+        transfer_records = connection.execute(
+            """
+            SELECT *
+            FROM transfer_records
+            WHERE voucher_id = ?
+            ORDER BY line_no ASC
+            """,
+            (voucher_id,),
+        ).fetchall()
     voucher["document_json"] = json.loads(voucher.get("document_json") or "{}")
     voucher["raw_ocr_json"] = json.loads(voucher.get("raw_ocr_json") or "{}")
     voucher["validation_json"] = json.loads(voucher.get("validation_json") or "{}")
@@ -149,7 +202,11 @@ def fetch_voucher(voucher_id: str) -> dict[str, Any] | None:
     voucher["document_json"].setdefault("llm_used", False)
     voucher["document_json"].setdefault("llm_status", "unused")
     voucher["document_json"].setdefault("llm_messages", [])
+    voucher["document_json"].setdefault("context_hints", [])
     voucher["items"] = items
+    for record in transfer_records:
+        record["validation_json"] = json.loads(record.get("validation_json") or "{}")
+    voucher["transfer_records"] = transfer_records
     voucher["audit_logs"] = logs
     return voucher
 
@@ -160,6 +217,7 @@ def insert_voucher(payload: dict[str, Any]) -> None:
             """
             INSERT INTO vouchers (
                 id,
+                batch_id,
                 type,
                 status,
                 needs_review,
@@ -185,6 +243,7 @@ def insert_voucher(payload: dict[str, Any]) -> None:
                 updated_at
             ) VALUES (
                 :id,
+                :batch_id,
                 :type,
                 :status,
                 :needs_review,
@@ -281,6 +340,93 @@ def update_voucher(voucher_id: str, payload: dict[str, Any], items: list[dict[st
             payload,
         )
         replace_voucher_items(connection, voucher_id, items)
+
+
+def replace_transfer_records(voucher_id: str, records: list[dict[str, Any]]) -> None:
+    timestamp = now_iso()
+    with connection_scope() as connection:
+        connection.execute("DELETE FROM transfer_records WHERE voucher_id = ?", (voucher_id,))
+        for line_no, record in enumerate(records, start=1):
+            connection.execute(
+                """
+                INSERT INTO transfer_records (
+                    id,
+                    voucher_id,
+                    line_no,
+                    vehicle_model,
+                    vehicle_number,
+                    pickup_datetime,
+                    pickup_location,
+                    delivery_datetime,
+                    delivery_location,
+                    confidence,
+                    needs_review,
+                    review_status,
+                    notes,
+                    validation_json,
+                    created_at,
+                    updated_at,
+                    reviewed_by,
+                    reviewed_at
+                ) VALUES (
+                    :id,
+                    :voucher_id,
+                    :line_no,
+                    :vehicle_model,
+                    :vehicle_number,
+                    :pickup_datetime,
+                    :pickup_location,
+                    :delivery_datetime,
+                    :delivery_location,
+                    :confidence,
+                    :needs_review,
+                    :review_status,
+                    :notes,
+                    :validation_json,
+                    :created_at,
+                    :updated_at,
+                    :reviewed_by,
+                    :reviewed_at
+                )
+                """,
+                {
+                    "id": record.get("id"),
+                    "voucher_id": voucher_id,
+                    "line_no": line_no,
+                    "vehicle_model": record.get("vehicle_model"),
+                    "vehicle_number": record.get("vehicle_number"),
+                    "pickup_datetime": record.get("pickup_datetime"),
+                    "pickup_location": record.get("pickup_location"),
+                    "delivery_datetime": record.get("delivery_datetime"),
+                    "delivery_location": record.get("delivery_location"),
+                    "confidence": record.get("confidence", 0.0),
+                    "needs_review": int(bool(record.get("needs_review", True))),
+                    "review_status": record.get("review_status") or "NEEDS_REVIEW",
+                    "notes": record.get("notes"),
+                    "validation_json": json.dumps(record.get("validation_json") or {}, ensure_ascii=False),
+                    "created_at": record.get("created_at") or timestamp,
+                    "updated_at": timestamp,
+                    "reviewed_by": record.get("reviewed_by"),
+                    "reviewed_at": record.get("reviewed_at"),
+                },
+            )
+
+
+def update_transfer_records(voucher_id: str, records: list[dict[str, Any]], reviewer: str | None = None) -> None:
+    timestamp = now_iso()
+    prepared: list[dict[str, Any]] = []
+    for record in records:
+        needs_review = bool(record.get("needs_review"))
+        prepared.append(
+            {
+                **record,
+                "review_status": "NEEDS_REVIEW" if needs_review else "REVIEWED",
+                "reviewed_by": reviewer,
+                "reviewed_at": None if needs_review else timestamp,
+                "updated_at": timestamp,
+            }
+        )
+    replace_transfer_records(voucher_id, prepared)
 
 
 def update_status(voucher_id: str, status: str, exported_at: str | None = None) -> None:

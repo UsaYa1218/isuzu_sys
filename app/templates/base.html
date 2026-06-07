@@ -9,9 +9,11 @@
   </head>
   <body>
     <header class="site-header">
-      <div class="container">
+      <div class="container header-inner">
         <a href="/" class="brand">{{ settings.app_name }}</a>
-        <p class="tagline">PaddleOCR + Ollama によるローカル伝票自動転記</p>
+        <nav class="header-actions" aria-label="主要操作">
+          <a class="ghost-button small-button" href="/export/transfer-summary.xlsx">陸送一覧Excel</a>
+        </nav>
       </div>
     </header>
     <main class="container">

@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import os
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -278,4 +279,52 @@ def export_voucher_csv_zip(voucher: dict) -> Path:
         archive.writestr("voucher_tables_index.csv", table_index_buffer.getvalue().encode("utf-8-sig"))
         for file_name, payload in table_archives:
             archive.writestr(file_name, payload)
+    return destination
+
+
+def export_transfer_summary_xlsx(vouchers: list[dict], operator_name: str | None = None) -> Path:
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "transfer_summary"
+    executed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    operator = operator_name or os.getenv("USERNAME") or os.getenv("USER") or ""
+    sheet.append(
+        [
+            "車型・車番",
+            "搬出日時",
+            "搬出場所",
+            "搬入日時",
+            "搬入場所",
+            "実行者",
+            "実行日時",
+            "読み取りファイル名",
+        ]
+    )
+
+    for voucher in vouchers:
+        records = voucher.get("transfer_records") or []
+        if not records:
+            continue
+        for record in records:
+            vehicle_parts = [
+                str(record.get("vehicle_model") or "").strip(),
+                str(record.get("vehicle_number") or "").strip(),
+            ]
+            vehicle_label = " / ".join(part for part in vehicle_parts if part)
+            sheet.append(
+                [
+                    vehicle_label,
+                    record.get("pickup_datetime"),
+                    record.get("pickup_location"),
+                    record.get("delivery_datetime"),
+                    record.get("delivery_location"),
+                    operator,
+                    executed_at,
+                    voucher.get("source_filename"),
+                ]
+            )
+
+    filename = f"transfer_summary_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}.xlsx"
+    destination = settings.export_dir / filename
+    workbook.save(destination)
     return destination
